@@ -22,6 +22,8 @@ using namespace ns3;
 bool readThroughput;
 bool readQueue;
 bool readReward;
+bool readCWND;
+bool readPolicy;
 //------------------------------ Global variable definition ends here --------------------------------
 
 //------------------------------ Global function definition ends here --------------------------------
@@ -379,101 +381,228 @@ struct State{
 	};
 //------------------------------State struct definition ends here ------------------------------------
 
+
+//------------------------------- NN class definition starts here --------------------------------------
+
+class NN{ //Assuming one hidden layer only and ReLu non-linearity
+public:
+	NN(double alpha_w, double hidden_size);
+	double getValue(std::vector<double> v);
+	void updateWeights(double tdError, std::vector<double> v);
+
+private:
+	double dotProduct(std::vector<double> v1, std::vector<double> v2);
+	void initializeWeights();
+
+
+	double m_alphaW;
+	double m_hiddenSize;
+	std::vector<std::vector<double>>m_weight0;
+	std::vector<double> m_bias0;
+	std::vector<double>m_weight1;
+	double m_bias1;
+
+};
+
+NN::NN(double alpha_w, double hidden_size){
+	m_alphaW = alpha_w;
+	m_hiddenSize = hidden_size;
+	initializeWeights();
+}
+
+void
+NN::initializeWeights(){
+	//Assuming the feature vector used has three elements: first two elements in state and change in cwnd
+	Ptr<NormalRandomVariable> sample = CreateObject<NormalRandomVariable>();
+	sample->SetAttribute("Mean", DoubleValue(0));
+	sample->SetAttribute("Variance", DoubleValue(2.0/static_cast<double>(m_hiddenSize)));
+	m_bias0.resize(m_hiddenSize, 0);
+
+	m_weight0.resize(m_hiddenSize);
+	m_weight1.resize(m_hiddenSize, 0);
+	for(uint32_t i =0; i < m_weight0.size(); ++i){
+		m_weight0[i].resize(3,0);
+		m_bias0[i] = sample->GetValue();
+		for(uint8_t j; j < 3; ++j){
+			m_weight0[i][j] = sample->GetValue();
+		}
+	}
+	sample->SetAttribute("Variance", DoubleValue(1));
+	m_bias1 = 0;
+	for(uint32_t i =0; i < m_weight0.size(); ++i){
+		m_weight1[i] = sample->GetValue();
+	}
+
+}
+double
+NN::dotProduct(std::vector<double> v1, std::vector<double> v2){
+	if(v1.size() != v2.size()){
+		std::cout<<"Vector sizes do not match!"<<std::endl;
+		exit(-1);
+	}
+	double sum = 0;
+	for(uint32_t i = 0; i < v1.size(); ++i){
+		sum += v1[i]*v2[i];
+	}
+	return sum;
+}
+
+double
+NN::getValue(std::vector<double> v){
+	if(v.size() != 3){
+		std::cout<<"Unsupported number of inputs! Your input has "<<v.size()<<" elements"<<std::endl;
+		exit(-1);
+	}
+	//Calculate the output from hidden layer
+	std::vector<double> hiddenOut;
+	for(int i = 0; i < m_hiddenSize; ++i){
+		double intermediate = dotProduct(v, m_weight0[i]) + m_bias0[i];
+		double res = intermediate > 0 ? intermediate : 0; //we will use ReLu as non-linear output
+		hiddenOut.push_back(res);
+	}
+	//calculate the output
+	return (dotProduct(hiddenOut, m_weight1) + m_bias1 );
+}
+
+void
+NN::updateWeights(double tdError, std::vector<double> v){
+	m_bias1 += m_alphaW*tdError;
+	for(int i = 0; i < m_hiddenSize; ++i){
+			double intermediate = dotProduct(v, m_weight0[i]) + m_bias0[i];
+			int res = intermediate > 0 ? 1 : 0; //we will use ReLu as non-linear output
+			double r = intermediate > 0 ? intermediate : 0;
+			m_bias0[i] += m_alphaW*res*m_weight1[i]*tdError;
+			for(uint8_t j = 0; j < v.size(); ++j){
+				m_weight0[i][j] += m_alphaW*v[j]*res*m_weight1[i]*tdError;
+			}
+			m_weight1[i] += m_alphaW*r*tdError;
+	}
+
+}
+//------------------------------- NN class definition ends here ----------------------------------------
+
 //------------------------------RLCompute class definition starts here -----------------------------
 
 class RLCompute {
 public:
-	RLCompute();
-	int compute(float reward, State lastState);
+	RLCompute(double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma);
+	int compute(float reward, State currState);
 
 private:
 	int actionSelect(State state);
 	void updateTheta();
 	double getActionValue(State state, int action);
-	std::vector<double> getStochasticPolicy(State state);
+	double getStochasticPolicy(State state, int action);
+	double getMean(State state);
+	double getStdv(State state);
+	std::vector<double> getFeatureVector(State s, int a);
 
-	double m_theta[3]; //as stated in the state struct + action
-	int m_actionWidth;
+	double m_thetaMean[2];
+	double m_thetaStdv[2];
 	float m_alphaTheta;
-	float m_alphaW;
 	float m_gamma;
 	State m_lastState;
 	int m_lastAction;
-	bool firstTime;
-	std::vector<double> m_stochasticPolicy;
+	bool m_firstTime;
+	bool m_isTerminal;
+	NN* m_nn;
 };
-RLCompute::RLCompute(){
-	m_theta[0] = 1;
-	m_theta[1] = 1;
-	m_theta[2] = 1;
-	m_alphaW = 0.5;
-	m_alphaTheta = 0.5;
-	m_actionWidth = 3;
-	m_gamma = 0.9;
-	firstTime = true;
+RLCompute::RLCompute(double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma){
+    for(int i = 0; i < 2; ++i){
+    	m_thetaMean[i] = 0;
+    	m_thetaStdv[i] = 0;
+    }
+    m_nn = new NN(alphaW, hiddenSize);
+	m_alphaTheta = alphaTheta;
+	m_gamma = gamma;
+	m_firstTime = true;
+	m_isTerminal = false;
+	m_lastAction = 0;
 }
 int
 RLCompute::compute(float reward, State currState){
+	if(m_isTerminal){
+		if(currState.isTerminal){
+			return m_lastAction;
+		}
+		m_isTerminal = false;
+		m_firstTime = true;
+	}
+	if(m_firstTime){
+		m_lastState = currState;
+		m_lastAction = actionSelect(m_lastState);
+		m_firstTime = false;
+		return m_lastAction;
+	}
+	if(currState.isTerminal){
+		std::cout<<"Agent stops learning"<<std::endl;
+		double td_error = reward  - getActionValue(m_lastState, m_lastAction);
+		m_nn->updateWeights(td_error, getFeatureVector(m_lastState, m_lastAction));
+		m_isTerminal = true;
+		return 0;
+	}
 	int next_action =  actionSelect(m_lastState);
-	m_stochasticPolicy = getStochasticPolicy(currState);
 	updateTheta();
-
-
+	double td_error = reward + m_gamma*getActionValue(currState, next_action) - getActionValue(m_lastState, m_lastAction);
+	m_nn->updateWeights(td_error, getFeatureVector(m_lastState, m_lastAction));
+	if(readPolicy){
+		std::cout<<"Current policy Mean = " << getMean(currState)<<std::endl;
+		std::cout<<"Current policy std = " << getStdv(currState)<<std::endl;
+	}
 
 	m_lastState = currState;
 	m_lastAction = next_action;
-	return 0;
+	return next_action;
 }
 
 void
 RLCompute::updateTheta(){
 	double Q = getActionValue(m_lastState,m_lastAction);
-	m_theta[0] += m_alphaTheta*Q*(m_lastState.ACKRatio-)
+	double mean_temp = getMean(m_lastState);
+	double stdv_temp = getStdv(m_lastState);
+	m_thetaMean[0] += m_alphaTheta*Q*(m_lastAction-mean_temp)*m_lastState.ACKRatio/(stdv_temp*stdv_temp);
+	m_thetaMean[1] += m_alphaTheta*Q*(m_lastAction-mean_temp)*m_lastState.ratioRTT/(stdv_temp*stdv_temp);
+	m_thetaStdv[0] += m_alphaTheta*Q*((m_lastAction-mean_temp)*(m_lastAction-mean_temp)/(stdv_temp*stdv_temp) - 1)*m_lastState.ACKRatio;
+	m_thetaStdv[1] += m_alphaTheta*Q*((m_lastAction-mean_temp)*(m_lastAction-mean_temp)/(stdv_temp*stdv_temp) - 1)*m_lastState.ratioRTT;
+}
+
+double
+RLCompute::getMean(State state){
+	return m_thetaMean[0]*state.ACKRatio + m_thetaMean[1]*state.ratioRTT;
+}
+
+double::
+RLCompute::getStdv(State state){
+	return std::exp(m_thetaStdv[0]*state.ACKRatio + m_thetaStdv[1]*state.ratioRTT);
+}
+double
+RLCompute::getStochasticPolicy(State state, int action){
+	double mean = getMean(state);
+	double stdv = getStdv(state);
+	double prob = std::exp(-(action-mean)/(2*stdv*stdv))/(stdv*std::sqrt(2*M_PI));
+	return prob;
 }
 
 std::vector<double>
-RLCompute::getStochasticPolicy(State state){
-	std::vector<double> exponentials;
-	double max = 0;
-	double sum = 0;
-
-	for(int i = 0; i < 2*m_actionWidth + 1 ; ++i){
-		double temp = m_theta[0]*state.ACKRatio + m_theta[1]*state.ratioRTT+m_theta[2]*(i-m_actionWidth);
-		if(max < temp){
-				max = temp;
-			}
-	}
-	for(int i = 0; i < 2*m_actionWidth + 1 ; ++i){
-		double calc_exp = std::exp(m_theta[0]*state.ACKRatio +m_theta[1]*state.ratioRTT + m_theta[2]*(i-m_actionWidth) - max);
-		sum += calc_exp;
-		exponentials.push_back(calc_exp);
-	}
-	for(int i = 0; i < 2*m_actionWidth + 1; ++i){
-		exponentials[i] = exponentials[i]/sum;
-	}
-	return exponentials;
+RLCompute::getFeatureVector(State s, int a){
+	std::vector<double> inp;
+	inp.push_back(s.ACKRatio);
+	inp.push_back(s.ratioRTT);
+	inp.push_back(a);
+	return inp;
 }
 double
 RLCompute::getActionValue(State state, int action){
-
+	return m_nn->getValue(getFeatureVector(state,action));
 }
 int
 RLCompute::actionSelect(State state){
-	//For now sample with epsilon greedy algorithm
-	Ptr<UniformRandomVariable> sample = CreateObject<UniformRandomVariable>();
-	sample->SetAttribute("Min", DoubleValue(0));
-	sample->SetAttribute("Max", DoubleValue(1));
+	Ptr<NormalRandomVariable> sample = CreateObject<NormalRandomVariable>();
+	sample->SetAttribute("Mean", DoubleValue(getMean(state)));
+	double stdv_temp = getStdv(state);
+	sample->SetAttribute("Variance", DoubleValue(stdv_temp*stdv_temp));
+	return static_cast<int>( sample->GetValue() + 0.5); //round to the nearest integer
 
-
-
-
-	double rand_number = sample->GetValue();
-	double sum = 0;
-	for(int i = 0; i < 2*m_actionWidth+1; ++i){
-		sum += exponentials[i];
-		if(sum > rand_number) return (i - m_actionWidth);
-	}
-	return 0;
 }
 
 //------------------------------RLCompute class definition ends here -----------------------------
@@ -486,7 +615,7 @@ public:
 	virtual ~UEApp();
 
 	void Setup (Address send, Address receive,  uint32_t packetSize, uint8_t ueId, DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
-			float positiveReward, float negativeReward);
+			float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma);
 
 protected:
 	void handleRead(Ptr<Socket> socket); //For congestion control
@@ -528,6 +657,11 @@ private:
 	float m_positiveReward;
 	float m_negativeReward;
 	RLCompute* rl;
+	double m_alphaW;
+	double m_alphaTheta;
+	double m_gamma;
+	uint16_t m_hiddenSize;
+	bool m_isCongested;
 
 };
 
@@ -540,7 +674,7 @@ UEApp:: ~UEApp() {
 
 void
 UEApp::Setup(Address addressSend, Address addressReceive, uint32_t packetSize, uint8_t ueId,  DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
-		float positiveReward, float negativeReward){
+		float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma){
 	m_packetSize = packetSize;
 	m_serverAddressSend = addressSend;
 	m_serverAddressReceive = addressReceive;
@@ -551,6 +685,10 @@ UEApp::Setup(Address addressSend, Address addressReceive, uint32_t packetSize, u
 	m_decisionPeriod = decisionPeriod;
 	m_positiveReward = positiveReward;
 	m_negativeReward = negativeReward;
+	m_alphaW = alphaW;
+	m_hiddenSize= hiddenSize;
+	m_alphaTheta = alphaTheta;
+	m_gamma = gamma;
 }
 
 void
@@ -561,10 +699,11 @@ UEApp::StartApplication (void)
   m_devRTT = 0;
   m_running = true;
   m_hasCalledNOAck = false;
+  m_isCongested = false;
   m_countRx = 0;
   m_countTx = 0;
   m_cwnd = 10;
-  rl = new RLCompute();
+  rl = new RLCompute(m_alphaW, m_hiddenSize, m_alphaTheta, m_gamma);
   m_RxcwndCounter = 0;
   m_cwndCounter = m_cwnd;
   m_averageReward = 0;
@@ -684,18 +823,18 @@ UEApp::handleRead(Ptr<Socket> socket){
 			 exit(-1);
 		 }
 		  if(!tag.isECNCapable()){
-				//std::cout<<"Not ECN capable tag detected"<<std::endl;
+				std::cout<<"Not ECN capable tag detected"<<std::endl;
 			}
 			else if(tag.isCongested()){
-				//std::cout<<"Is congested"<<std::endl;
+				m_isCongested = true;
 			}
 			else if(tag.isPositiveReward()){
-				//std::cout<<"Got positive reward"<<std::endl;
+				m_isCongested = false;
 				m_countRx += 1;
 				m_averageReward  +=(m_positiveReward - m_averageReward)/m_countRx;
 			}
 			else{
-				//std::cout<<"Got negative reward"<<std::endl;
+				m_isCongested = false;
 				m_countRx += 1;
 				m_averageReward  +=(m_negativeReward - m_averageReward)/m_countRx;
 			}
@@ -727,47 +866,94 @@ UEApp::handleRead(Ptr<Socket> socket){
 
 void
 UEApp::updateReward(){
-    //TODO: inform the RLCompute about the reward
+	State curr_state;
+	if(m_countTx != 0){
+		curr_state.ACKRatio = static_cast<double>(m_countRx)/m_countTx ;
+	}
+	else{
+		curr_state.ACKRatio = 0;
+	}
+	if(m_minRTT != 0){
+		curr_state.ratioRTT = m_estimatedRTT/m_minRTT;
+	}
+	else{
+		curr_state.ratioRTT = 1;
+	}
 	if(readReward){
 		std::cout<<"Get average reward = " << m_averageReward << std::endl;
-		if(m_countRx != 0){
-		std::cout<<"ACK ratio =  " << static_cast<double>(m_countRx)/m_countTx << std::endl;
+		if(m_countTx != 0){
+		std::cout<<"ACK ratio =  " << curr_state.ACKRatio << std::endl;
 		}
 		else{
-			std::cout<<"count RX is zero"<<std::endl;
+			std::cout<<"count TX is zero"<<std::endl;
 		}
 		if(m_minRTT != 0)
-		std::cout<<"RTT ratio = " << m_estimatedRTT/m_minRTT << std::endl;
+		std::cout<<"RTT ratio = " << curr_state.ratioRTT << std::endl;
 		else
 			std::cout<<"m_minRTT is zero"<<std::endl;
 	}
-	State curr_state;
-	curr_state.ACKRatio = static_cast<double>(m_countRx)/m_countTx ;
-	curr_state.ratioRTT = m_estimatedRTT/m_minRTT;
-	curr_state.isTerminal = false;
-	int change = rl->compute(m_averageReward, curr_state);
-	if(static_cast<int>(m_cwnd) < -change){
-		m_cwnd = 1;
+
+	if(m_isCongested){
+		curr_state.isTerminal = true;
+		 rl->compute(m_averageReward, curr_state);
+		m_cwnd = m_cwnd - 1;
+
 	}
 	else{
-		m_cwnd += change;
+		curr_state.isTerminal = false;
+		int change = rl->compute(m_averageReward, curr_state);
+		if(static_cast<int>(m_cwnd) <= -change){
+			//NO change
+		}
+		else{
+			m_cwnd += change;
+		}
+	}
+	if(m_cwnd < 1){
+				m_cwnd = 1;
+		}
+	if(readCWND){
+		std::cout<<"Current CWND = " << m_cwnd << std::endl;
 	}
 	m_countRx= 0;
 	m_countTx = 0;
 	m_averageReward = 0;
 	Simulator::Schedule (m_decisionPeriod, &UEApp::updateReward, this);
 }
+
 int
 main (int argc, char *argv[])
 {
-	readThroughput = false;
-	readQueue = false;
-	readReward = false;
+	/*RLCompute rltest;
+	State test_state;
+	test_state.ACKRatio = 0.9;
+	test_state.ratioRTT = 1.3;
+	test_state.isTerminal = false;
+	float reward = 0.9;
+	rltest.compute(reward, test_state);
+
+
+	test_state.ACKRatio = 0.5;
+	test_state.ratioRTT = 1.8;
+	test_state.isTerminal = false;
+	reward = -1.3;
+	rltest.compute(reward, test_state);
+
+	test_state.ACKRatio = 0.4;
+	test_state.ratioRTT = 2.0;
+	test_state.isTerminal = true;
+	reward = -2;
+	rltest.compute(reward, test_state);*/
+	readThroughput = true;
+	readQueue = true;
+	readReward =false;
+	readCWND = false;
+	readPolicy = false;
 
 	 uint16_t ulPort = 10000;  //Uplink port offset
 	 uint16_t dlPort = 20000;  //Downlink port offset
 	 Time startTime = Seconds(0.03);  //start application time
-	 Time simTime = Seconds(2); //simulation time
+	 Time simTime = Seconds(10); //simulation time
 	 uint16_t packetSize = 100; //packet size of UDP in bits
 	 double errorRate = 0.005; //Dropping rate due to receiving side of eNB
 	 DataRate dataRate = DataRate("0.46Mbps");
@@ -778,6 +964,10 @@ main (int argc, char *argv[])
 	 float posReward = 2;
 	 float negReward = -2;
 	 Time decisionTime = MilliSeconds(10);
+	 double alphaW = 0.001;
+	 uint32_t hiddenSize = 8;
+	 double alphaTheta = 0.001;
+	 double gamma = 0.9;
 
 
 	 NodeContainer nodes;
@@ -817,7 +1007,7 @@ main (int argc, char *argv[])
 
 		Ptr<UEApp> app1 = CreateObject<UEApp>();
 		app1->Setup(InetSocketAddress(interfaces.GetAddress(1), ulPort), InetSocketAddress(interfaces.GetAddress(0), dlPort), packetSize, 0,  dataRate, ulPort, dlPort, decisionTime, posReward,
-				negReward);
+				negReward, alphaW, hiddenSize, alphaTheta, gamma);
 		nodes.Get(0)->AddApplication(app1);
 		app1->SetStartTime (startTime);
 		app1->SetStopTime (simTime);
