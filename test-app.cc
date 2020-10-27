@@ -14,6 +14,8 @@
 #include "ns3/config-store-module.h"
 #include "ns3/traffic-control-module.h"
 #include <cmath>
+#include <fstream>
+#include "ns3/gnuplot.h"
 
 
 using namespace ns3;
@@ -24,6 +26,7 @@ bool readQueue;
 bool readReward;
 bool readCWND;
 bool readPolicy;
+std::vector<uint32_t> trackCWND;
 //------------------------------ Global variable definition ends here --------------------------------
 
 //------------------------------ Global function definition ends here --------------------------------
@@ -185,7 +188,7 @@ private:
 
 	std::vector<Ptr<Socket>>     m_socketReceivers;
 	std::vector<Ptr<Socket>>  m_socketSenders;
-	std::vector<Time> m_lastReceivedTimes;
+	std::vector<std::vector<Time>> m_lastReceivedTimes;
 	std::vector <std::pair<Address, uint8_t>> m_addressNodePairs;
 	uint32_t        m_packetSize;
 	DataRate        m_dataRate;
@@ -238,7 +241,7 @@ EnbApp::setExpectedThroughput(bool isComingUE){
 		std::cout<<"Currently we dont support such queue size or drop "<<std::endl;
 		exit(-1);
 	}
-	m_expectedThroughput = 1.09*m_packetSize*8/(m_serviceTime.GetMicroSeconds()) ; //The coefficient 1.09 vary with maximum queue size. The unit is in Mbps
+	m_expectedThroughput = 1.1*m_packetSize*8/(m_serviceTime.GetMicroSeconds()) ; //The coefficient 1.1 vary with maximum queue size. The unit is in Mbps
 
 	if(isComingUE){
 		m_numberOfUE++;
@@ -259,8 +262,12 @@ EnbApp::StartApplication (void)
   m_numberOfUE = 0;
   m_queueCounter = 0;
   Time current_time = Simulator::Now();
+  m_lastReceivedTimes.resize(m_addressNodePairs.size());
   for(uint8_t i = 0; i < m_addressNodePairs.size(); ++i){
-	 m_lastReceivedTimes.push_back(current_time);
+	  for(uint8_t j = 0; j < 3 ; ++j){
+		  m_lastReceivedTimes[i].push_back(current_time);
+	  }
+
   }
   for(auto it = m_addressNodePairs.begin(); it != m_addressNodePairs.end(); ++it){
 	  Ptr<Socket> tcpSenderSocket = Socket::CreateSocket (this->GetNode(), UdpSocketFactory::GetTypeId ());
@@ -287,6 +294,7 @@ void
 EnbApp::handleRead(Ptr<Socket> socket){
 	++m_queueCounter;
 	if(readQueue){
+		if(m_queueCounter > 30)
 		std::cout<<"Current scheduler queue size: "<<m_queueCounter<<std::endl;
 	}
 	if(!m_running) {return;}
@@ -323,12 +331,14 @@ EnbApp::handleRead(Ptr<Socket> socket){
 		}
 
 		Time current_time = Simulator::Now();
-		float current_throughput = packet->GetSize()*8.0/(current_time.GetSeconds() - m_lastReceivedTimes[ueId].GetSeconds())/1e6;
+		float current_throughput = 3*packet->GetSize()*8.0/(current_time.GetSeconds() + m_lastReceivedTimes[ueId][0].GetSeconds() + m_lastReceivedTimes[ueId][1].GetSeconds() -  3*m_lastReceivedTimes[ueId][2].GetSeconds())/1e6;
 		if(readThroughput){
 			std::cout<<"Current throughput: "<<current_throughput << std::endl;
 			std::cout<<"Compared throughput:"<<m_expectedThroughput<<std::endl;
 		}
-		m_lastReceivedTimes[ueId] = current_time;
+		m_lastReceivedTimes[ueId][2] = m_lastReceivedTimes[ueId][1];
+		m_lastReceivedTimes[ueId][1] = m_lastReceivedTimes[ueId][0];
+		m_lastReceivedTimes[ueId][0] = current_time;
 		if(ecnTag.isPositiveReward()){
 			if(current_throughput > m_expectedThroughput|| current_throughput < (m_eta*m_expectedThroughput)){
 				//Send to UE directly
@@ -896,13 +906,19 @@ UEApp::updateReward(){
 	if(m_isCongested){
 		curr_state.isTerminal = true;
 		 rl->compute(m_averageReward, curr_state);
-		m_cwnd = m_cwnd - 1;
-
+		if(m_cwnd > 10){
+			m_cwnd = m_cwnd *3/4;
+		}
+		else{
+			m_cwnd = 10;
+		}
 	}
 	else{
 		curr_state.isTerminal = false;
 		int change = rl->compute(m_averageReward, curr_state);
-		if(static_cast<int>(m_cwnd) <= -change){
+		int test_cwnd = m_cwnd + change;
+		std::cout<<"Change: "<<change<<std::endl;
+		if(test_cwnd < 1){
 			//NO change
 		}
 		else{
@@ -924,36 +940,17 @@ UEApp::updateReward(){
 int
 main (int argc, char *argv[])
 {
-	/*RLCompute rltest;
-	State test_state;
-	test_state.ACKRatio = 0.9;
-	test_state.ratioRTT = 1.3;
-	test_state.isTerminal = false;
-	float reward = 0.9;
-	rltest.compute(reward, test_state);
 
-
-	test_state.ACKRatio = 0.5;
-	test_state.ratioRTT = 1.8;
-	test_state.isTerminal = false;
-	reward = -1.3;
-	rltest.compute(reward, test_state);
-
-	test_state.ACKRatio = 0.4;
-	test_state.ratioRTT = 2.0;
-	test_state.isTerminal = true;
-	reward = -2;
-	rltest.compute(reward, test_state);*/
-	readThroughput = true;
-	readQueue = true;
+	readThroughput = false;
+	readQueue = false;
 	readReward =false;
-	readCWND = false;
-	readPolicy = false;
+	readCWND = true;
+	readPolicy = true;
 
 	 uint16_t ulPort = 10000;  //Uplink port offset
 	 uint16_t dlPort = 20000;  //Downlink port offset
 	 Time startTime = Seconds(0.03);  //start application time
-	 Time simTime = Seconds(10); //simulation time
+	 Time simTime = Seconds(180); //simulation time
 	 uint16_t packetSize = 100; //packet size of UDP in bits
 	 double errorRate = 0.005; //Dropping rate due to receiving side of eNB
 	 DataRate dataRate = DataRate("0.46Mbps");
@@ -962,10 +959,10 @@ main (int argc, char *argv[])
 	 uint16_t queueSize= 25;
 	 double dropFullProbability = 0.9;
 	 float posReward = 2;
-	 float negReward = -2;
+	 float negReward = -3;
 	 Time decisionTime = MilliSeconds(10);
 	 double alphaW = 0.001;
-	 uint32_t hiddenSize = 8;
+	 uint32_t hiddenSize = 20;
 	 double alphaTheta = 0.001;
 	 double gamma = 0.9;
 
