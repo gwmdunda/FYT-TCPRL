@@ -1,4 +1,11 @@
 /*
+ * softmax-lte.cc
+ *
+ *  Created on: Oct 27, 2020
+ *      Author: tcp
+ */
+
+/*
  * test-app.cc
  *
  *  Created on: Oct 7, 2020
@@ -26,7 +33,10 @@ bool readQueue;
 bool readReward;
 bool readCWND;
 bool readPolicy;
+bool readBias;
 std::vector<uint32_t> trackCWND;
+double trackExpectedThroughput;
+std::vector<std::pair<Time, double>> trackCalculatedThroughput;
 //------------------------------ Global variable definition ends here --------------------------------
 
 //------------------------------ Global function definition ends here --------------------------------
@@ -203,6 +213,8 @@ private:
     Ptr<UniformRandomVariable> sample;
     uint8_t m_numberOfUE;
     float m_expectedThroughput; //Should be the same across the user to ensure fairness
+    float accumulatedBytes; //TODO to support N users
+    double current_throughput;
 };
 
 EnbApp::EnbApp ()
@@ -237,11 +249,9 @@ EnbApp::Setup (std::vector <std::pair<Address, uint8_t>> addressNodePairs,
 void
 EnbApp::setExpectedThroughput(bool isComingUE){
 
-	if(m_maxQueueSize != 25){
-		std::cout<<"Currently we dont support such queue size or drop "<<std::endl;
-		exit(-1);
-	}
+
 	m_expectedThroughput = 1.1*m_packetSize*8/(m_serviceTime.GetMicroSeconds()) ; //The coefficient 1.1 vary with maximum queue size. The unit is in Mbps
+	//m_expectedThroughput = 2.7;
 
 	if(isComingUE){
 		m_numberOfUE++;
@@ -253,11 +263,13 @@ EnbApp::setExpectedThroughput(bool isComingUE){
 			m_expectedThroughput = m_expectedThroughput/m_numberOfUE;
 		}
 	}
+	trackExpectedThroughput = m_expectedThroughput;
 }
 void
 EnbApp::StartApplication (void)
 {
   std::cout<< " Starting ENB Application" << std::endl;
+  current_throughput = 0;
   m_running = true;
   m_numberOfUE = 0;
   m_queueCounter = 0;
@@ -319,6 +331,7 @@ EnbApp::handleRead(Ptr<Socket> socket){
 			std::cout<<"Fatal Error: Timestamp not found!"<<std::endl;
 			exit(-1);
 		}
+		accumulatedBytes += packet->GetSize();
 		uint8_t ueId = tcpTag.getId();
 		if(m_queueCounter > m_maxQueueSize){
 			 double val = sample->GetValue();
@@ -331,14 +344,21 @@ EnbApp::handleRead(Ptr<Socket> socket){
 		}
 
 		Time current_time = Simulator::Now();
-		float current_throughput = 3*packet->GetSize()*8.0/(current_time.GetSeconds() + m_lastReceivedTimes[ueId][0].GetSeconds() + m_lastReceivedTimes[ueId][1].GetSeconds() -  3*m_lastReceivedTimes[ueId][2].GetSeconds())/1e6;
+
+		//float current_throughput = 3*packet->GetSize()*8.0/(current_time.GetSeconds() + m_lastReceivedTimes[ueId][0].GetSeconds() + m_lastReceivedTimes[ueId][1].GetSeconds() -  3*m_lastReceivedTimes[ueId][2].GetSeconds())/1e6;
+		if(current_time - m_lastReceivedTimes[ueId][0] > m_serviceTime){
+			current_throughput = 0.7*current_throughput + 0.3*accumulatedBytes*8/(current_time - m_lastReceivedTimes[ueId][0]).GetMicroSeconds();
+			accumulatedBytes = 0;
+			m_lastReceivedTimes[ueId][0] = current_time;
+		}
+		trackCalculatedThroughput.push_back(std::make_pair(current_time, current_throughput));
 		if(readThroughput){
 			std::cout<<"Current throughput: "<<current_throughput << std::endl;
 			std::cout<<"Compared throughput:"<<m_expectedThroughput<<std::endl;
 		}
-		m_lastReceivedTimes[ueId][2] = m_lastReceivedTimes[ueId][1];
+		/*m_lastReceivedTimes[ueId][2] = m_lastReceivedTimes[ueId][1];
 		m_lastReceivedTimes[ueId][1] = m_lastReceivedTimes[ueId][0];
-		m_lastReceivedTimes[ueId][0] = current_time;
+		m_lastReceivedTimes[ueId][0] = current_time;*/
 		if(ecnTag.isPositiveReward()){
 			if(current_throughput > m_expectedThroughput|| current_throughput < (m_eta*m_expectedThroughput)){
 				//Send to UE directly
@@ -403,7 +423,7 @@ public:
 private:
 	double dotProduct(std::vector<double> v1, std::vector<double> v2);
 	void initializeWeights();
-
+    double sigmoid(double x);
 
 	double m_alphaW;
 	double m_hiddenSize;
@@ -458,6 +478,11 @@ NN::dotProduct(std::vector<double> v1, std::vector<double> v2){
 }
 
 double
+NN::sigmoid(double x){
+	return 1/(1+std::exp(-x));
+}
+
+double
 NN::getValue(std::vector<double> v){
 	if(v.size() != 3){
 		std::cout<<"Unsupported number of inputs! Your input has "<<v.size()<<" elements"<<std::endl;
@@ -467,7 +492,8 @@ NN::getValue(std::vector<double> v){
 	std::vector<double> hiddenOut;
 	for(int i = 0; i < m_hiddenSize; ++i){
 		double intermediate = dotProduct(v, m_weight0[i]) + m_bias0[i];
-		double res = intermediate > 0 ? intermediate : 0; //we will use ReLu as non-linear output
+		//double res = intermediate > 0 ? intermediate : 0; //we will use ReLu as non-linear output
+		double res = sigmoid(intermediate); //We will use sigmoid as non-linear output
 		hiddenOut.push_back(res);
 	}
 	//calculate the output
@@ -476,8 +502,16 @@ NN::getValue(std::vector<double> v){
 
 void
 NN::updateWeights(double tdError, std::vector<double> v){
+	if(readBias){
+		std::cout<<"Bias layer 0: ";
+		for(uint8_t i = 0; i < m_bias0.size(); ++i){
+			std::cout<<m_bias0[i]<<"   ";
+		}
+		std::cout<<std::endl;
+		std::cout<<"Bias layer 1: "<< m_bias1 << std::endl;
+	}
 	m_bias1 += m_alphaW*tdError;
-	for(int i = 0; i < m_hiddenSize; ++i){
+	/*for(int i = 0; i < m_hiddenSize; ++i){
 			double intermediate = dotProduct(v, m_weight0[i]) + m_bias0[i];
 			int res = intermediate > 0 ? 1 : 0; //we will use ReLu as non-linear output
 			double r = intermediate > 0 ? intermediate : 0;
@@ -486,6 +520,15 @@ NN::updateWeights(double tdError, std::vector<double> v){
 				m_weight0[i][j] += m_alphaW*v[j]*res*m_weight1[i]*tdError;
 			}
 			m_weight1[i] += m_alphaW*r*tdError;
+	}*/
+	for(int i = 0; i < m_hiddenSize; ++i){
+		double intermediate = dotProduct(v, m_weight0[i]) + m_bias0[i];
+		double res = sigmoid(intermediate);
+		m_weight1[i] += m_alphaW*res*tdError;
+		m_bias0[i] += m_alphaW*res*(1.0-res)*m_weight1[i]*tdError;
+		for(uint8_t j = 0; j < v.size(); ++j){
+						m_weight0[i][j] += m_alphaW*v[j]*res*(1.0-res)*m_weight1[i]*tdError;
+				}
 	}
 
 }
@@ -495,20 +538,20 @@ NN::updateWeights(double tdError, std::vector<double> v){
 
 class RLCompute {
 public:
-	RLCompute(double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma);
+	RLCompute(int action_bound, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma);
 	int compute(float reward, State currState);
 
 private:
 	int actionSelect(State state);
 	void updateTheta();
 	double getActionValue(State state, int action);
-	double getStochasticPolicy(State state, int action);
-	double getMean(State state);
-	double getStdv(State state);
+	void updateStochasticPolicy(State state);
 	std::vector<double> getFeatureVector(State s, int a);
 
-	double m_thetaMean[2];
-	double m_thetaStdv[2];
+	std::vector<double> m_thetaRTT;
+	std::vector<double> m_thetaACK;
+	std::vector<double> m_policy;
+	int m_actionBound;
 	float m_alphaTheta;
 	float m_gamma;
 	State m_lastState;
@@ -517,11 +560,15 @@ private:
 	bool m_isTerminal;
 	NN* m_nn;
 };
-RLCompute::RLCompute(double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma){
-    for(int i = 0; i < 2; ++i){
-    	m_thetaMean[i] = 0;
-    	m_thetaStdv[i] = 0;
-    }
+RLCompute::RLCompute(int action_bound, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma){
+	m_actionBound = action_bound;
+	Ptr<NormalRandomVariable> sampleX = CreateObject<NormalRandomVariable>();
+	sampleX->SetAttribute("Mean", DoubleValue(0));
+	sampleX->SetAttribute("Variance", DoubleValue(1));
+	for(int i =0; i < 2*m_actionBound + 1; ++i){
+		m_thetaACK.push_back(sampleX->GetValue());
+		m_thetaRTT.push_back(sampleX->GetValue());
+	}
     m_nn = new NN(alphaW, hiddenSize);
 	m_alphaTheta = alphaTheta;
 	m_gamma = gamma;
@@ -540,6 +587,7 @@ RLCompute::compute(float reward, State currState){
 	}
 	if(m_firstTime){
 		m_lastState = currState;
+		updateStochasticPolicy(currState);
 		m_lastAction = actionSelect(m_lastState);
 		m_firstTime = false;
 		return m_lastAction;
@@ -551,15 +599,18 @@ RLCompute::compute(float reward, State currState){
 		m_isTerminal = true;
 		return 0;
 	}
-	int next_action =  actionSelect(m_lastState);
 	updateTheta();
+	updateStochasticPolicy(currState);
+	int next_action =  actionSelect(m_lastState);
 	double td_error = reward + m_gamma*getActionValue(currState, next_action) - getActionValue(m_lastState, m_lastAction);
 	m_nn->updateWeights(td_error, getFeatureVector(m_lastState, m_lastAction));
 	if(readPolicy){
-		std::cout<<"Current policy Mean = " << getMean(currState)<<std::endl;
-		std::cout<<"Current policy std = " << getStdv(currState)<<std::endl;
+		std::cout<<"[ ";
+		for(int i = 0; i < 2*m_actionBound ;++i){
+			std::cout<<m_policy[i]<<" , ";
+		}
+		std::cout<<m_policy[2*m_actionBound]<<" ]"<<std::endl;
 	}
-
 	m_lastState = currState;
 	m_lastAction = next_action;
 	return next_action;
@@ -568,29 +619,39 @@ RLCompute::compute(float reward, State currState){
 void
 RLCompute::updateTheta(){
 	double Q = getActionValue(m_lastState,m_lastAction);
-	double mean_temp = getMean(m_lastState);
-	double stdv_temp = getStdv(m_lastState);
-	m_thetaMean[0] += m_alphaTheta*Q*(m_lastAction-mean_temp)*m_lastState.ACKRatio/(stdv_temp*stdv_temp);
-	m_thetaMean[1] += m_alphaTheta*Q*(m_lastAction-mean_temp)*m_lastState.ratioRTT/(stdv_temp*stdv_temp);
-	m_thetaStdv[0] += m_alphaTheta*Q*((m_lastAction-mean_temp)*(m_lastAction-mean_temp)/(stdv_temp*stdv_temp) - 1)*m_lastState.ACKRatio;
-	m_thetaStdv[1] += m_alphaTheta*Q*((m_lastAction-mean_temp)*(m_lastAction-mean_temp)/(stdv_temp*stdv_temp) - 1)*m_lastState.ratioRTT;
+	double sum_RTT = 0;
+	double sum_ACK = 0;
+	for(int i = 0; i < 2*m_actionBound + 1; ++i){
+		sum_ACK += m_policy[i]*m_thetaACK[i]*m_lastState.ACKRatio;
+		sum_RTT += m_policy[i]*m_thetaRTT[i]*m_lastState.ratioRTT;
+	}
+	for(int i = 0; i < 2*m_actionBound + 1; ++i){
+		m_thetaACK[i] += m_alphaTheta*Q*(m_thetaACK[i]*m_lastState.ACKRatio - sum_ACK);
+		m_thetaRTT[i] += m_alphaTheta*Q*(m_thetaRTT[i]*m_lastState.ratioRTT - sum_RTT);
+	}
 }
 
-double
-RLCompute::getMean(State state){
-	return m_thetaMean[0]*state.ACKRatio + m_thetaMean[1]*state.ratioRTT;
-}
 
-double::
-RLCompute::getStdv(State state){
-	return std::exp(m_thetaStdv[0]*state.ACKRatio + m_thetaStdv[1]*state.ratioRTT);
-}
-double
-RLCompute::getStochasticPolicy(State state, int action){
-	double mean = getMean(state);
-	double stdv = getStdv(state);
-	double prob = std::exp(-(action-mean)/(2*stdv*stdv))/(stdv*std::sqrt(2*M_PI));
-	return prob;
+void
+RLCompute::updateStochasticPolicy(State state){
+	 std::vector<double> h;
+	 double maxVal = -10000000;
+	 for(int i = 0; i < 2*m_actionBound + 1; ++i){
+		 double temp = m_thetaACK[i]*state.ACKRatio + m_thetaRTT[i]*state.ratioRTT;
+		 if(temp > maxVal) maxVal = temp;
+		 h.push_back(temp);
+	 }
+	 double normalization = 0;
+	 for(int i = 0; i < 2*m_actionBound + 1; ++i){
+		 h[i] -= maxVal;
+		 h[i] = std::exp(h[i]);
+		 normalization += h[i];
+	 }
+	 for(int i = 0; i < 2*m_actionBound + 1; ++i){
+		 h[i] = h[i]/normalization;
+	 }
+	m_policy = h;
+
 }
 
 std::vector<double>
@@ -601,17 +662,23 @@ RLCompute::getFeatureVector(State s, int a){
 	inp.push_back(a);
 	return inp;
 }
+
 double
 RLCompute::getActionValue(State state, int action){
 	return m_nn->getValue(getFeatureVector(state,action));
 }
 int
 RLCompute::actionSelect(State state){
-	Ptr<NormalRandomVariable> sample = CreateObject<NormalRandomVariable>();
-	sample->SetAttribute("Mean", DoubleValue(getMean(state)));
-	double stdv_temp = getStdv(state);
-	sample->SetAttribute("Variance", DoubleValue(stdv_temp*stdv_temp));
-	return static_cast<int>( sample->GetValue() + 0.5); //round to the nearest integer
+	Ptr<UniformRandomVariable> sample = CreateObject<UniformRandomVariable>();
+		sample->SetAttribute("Min", DoubleValue(0));
+		sample->SetAttribute("Max", DoubleValue(1));
+		double rand_number = sample->GetValue();
+		double sum = 0;
+		for(int i = 0; i < 2*m_actionBound+1; ++i){
+			sum += m_policy[i];
+			if(sum > rand_number) return (i - m_actionBound);
+		}
+		return 0;
 
 }
 
@@ -625,7 +692,7 @@ public:
 	virtual ~UEApp();
 
 	void Setup (Address send, Address receive,  uint32_t packetSize, uint8_t ueId, DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
-			float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma);
+			float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma, int actionBound);
 
 protected:
 	void handleRead(Ptr<Socket> socket); //For congestion control
@@ -672,6 +739,7 @@ private:
 	double m_gamma;
 	uint16_t m_hiddenSize;
 	bool m_isCongested;
+	int m_actionBound;
 
 };
 
@@ -684,7 +752,7 @@ UEApp:: ~UEApp() {
 
 void
 UEApp::Setup(Address addressSend, Address addressReceive, uint32_t packetSize, uint8_t ueId,  DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
-		float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma){
+		float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, double alphaTheta, double gamma, int actionBound){
 	m_packetSize = packetSize;
 	m_serverAddressSend = addressSend;
 	m_serverAddressReceive = addressReceive;
@@ -699,6 +767,7 @@ UEApp::Setup(Address addressSend, Address addressReceive, uint32_t packetSize, u
 	m_hiddenSize= hiddenSize;
 	m_alphaTheta = alphaTheta;
 	m_gamma = gamma;
+	m_actionBound = actionBound;
 }
 
 void
@@ -713,7 +782,7 @@ UEApp::StartApplication (void)
   m_countRx = 0;
   m_countTx = 0;
   m_cwnd = 10;
-  rl = new RLCompute(m_alphaW, m_hiddenSize, m_alphaTheta, m_gamma);
+  rl = new RLCompute(m_actionBound, m_alphaW, m_hiddenSize, m_alphaTheta, m_gamma);
   m_RxcwndCounter = 0;
   m_cwndCounter = m_cwnd;
   m_averageReward = 0;
@@ -876,6 +945,11 @@ UEApp::handleRead(Ptr<Socket> socket){
 
 void
 UEApp::updateReward(){
+	if(m_cwndCounter == 0){
+		//Agent must do nothing when timeout
+		Simulator::Schedule (m_decisionPeriod, &UEApp::updateReward, this);
+		return;
+	}
 	State curr_state;
 	if(m_countTx != 0){
 		curr_state.ACKRatio = static_cast<double>(m_countRx)/m_countTx ;
@@ -917,7 +991,6 @@ UEApp::updateReward(){
 		curr_state.isTerminal = false;
 		int change = rl->compute(m_averageReward, curr_state);
 		int test_cwnd = m_cwnd + change;
-		std::cout<<"Change: "<<change<<std::endl;
 		if(test_cwnd < 1){
 			//NO change
 		}
@@ -931,6 +1004,7 @@ UEApp::updateReward(){
 	if(readCWND){
 		std::cout<<"Current CWND = " << m_cwnd << std::endl;
 	}
+	trackCWND.push_back(m_cwnd);
 	m_countRx= 0;
 	m_countTx = 0;
 	m_averageReward = 0;
@@ -944,27 +1018,29 @@ main (int argc, char *argv[])
 	readThroughput = false;
 	readQueue = false;
 	readReward =false;
-	readCWND = true;
-	readPolicy = true;
+	readCWND = false;
+	readPolicy = false;
+	readBias = false;
 
 	 uint16_t ulPort = 10000;  //Uplink port offset
 	 uint16_t dlPort = 20000;  //Downlink port offset
 	 Time startTime = Seconds(0.03);  //start application time
 	 Time simTime = Seconds(180); //simulation time
 	 uint16_t packetSize = 100; //packet size of UDP in bits
-	 double errorRate = 0.005; //Dropping rate due to receiving side of eNB
-	 DataRate dataRate = DataRate("0.46Mbps");
-	 Time queueDelay = MicroSeconds(200);
-	 float eta = 0.8;
-	 uint16_t queueSize= 25;
+	 double errorRate = 0.0001; //Dropping rate due to receiving side of eNB
+	 DataRate dataRate = DataRate("0.01Mbps");
+	 Time queueDelay = MicroSeconds(100);
+	 float eta = 0.9;
+	 uint16_t queueSize= 50;
 	 double dropFullProbability = 0.9;
-	 float posReward = 2;
-	 float negReward = -3;
-	 Time decisionTime = MilliSeconds(10);
-	 double alphaW = 0.001;
-	 uint32_t hiddenSize = 20;
-	 double alphaTheta = 0.001;
+	 float posReward = 20;
+	 float negReward = -20;
+	 Time decisionTime = MilliSeconds(20);
+	 double alphaW = 0.0001;
+	 uint32_t hiddenSize = 7;
+	 double alphaTheta = 0.00001;
 	 double gamma = 0.9;
+	 int actionBound = 5;
 
 
 	 NodeContainer nodes;
@@ -973,7 +1049,7 @@ main (int argc, char *argv[])
 	  PointToPointHelper pointToPoint;
 	  pointToPoint.SetDeviceAttribute ("DataRate", StringValue ("1Gbps"));
 	  pointToPoint.SetChannelAttribute ("Delay", StringValue ("10ms"));
-	  pointToPoint.SetQueue ("ns3::DropTailQueue", "MaxSize", StringValue ("8000p"));
+	  pointToPoint.SetQueue ("ns3::DropTailQueue", "MaxSize", StringValue ("80000000p"));
 
 	  NetDeviceContainer devices;
 		devices = pointToPoint.Install (nodes);
@@ -1004,7 +1080,7 @@ main (int argc, char *argv[])
 
 		Ptr<UEApp> app1 = CreateObject<UEApp>();
 		app1->Setup(InetSocketAddress(interfaces.GetAddress(1), ulPort), InetSocketAddress(interfaces.GetAddress(0), dlPort), packetSize, 0,  dataRate, ulPort, dlPort, decisionTime, posReward,
-				negReward, alphaW, hiddenSize, alphaTheta, gamma);
+				negReward, alphaW, hiddenSize, alphaTheta, gamma, actionBound);
 		nodes.Get(0)->AddApplication(app1);
 		app1->SetStartTime (startTime);
 		app1->SetStopTime (simTime);
@@ -1013,7 +1089,70 @@ main (int argc, char *argv[])
 		Simulator::Run ();
 		Simulator::Destroy ();
 
-		  return 0;
+		 std::string fileNameWithNoExtension = "cwnd-plot";
+		 std::string graphicsFileName  = fileNameWithNoExtension + ".png";
+		 std::string plotFileName  = fileNameWithNoExtension + ".plt";
+		 std::string dataTitle = "CWND";
+
+		 Gnuplot plot (graphicsFileName);
+		 plot.SetTitle ("CWND-Softmax");
+		 plot.SetTerminal ("png");
+		 plot.SetLegend ("time (ms)", "CWND");
+		 plot.AppendExtra ("set yrange [0:+1000]");
+		 Gnuplot2dDataset dataset;
+		 dataset.SetTitle(dataTitle);
+		 dataset.SetStyle (Gnuplot2dDataset::LINES);
+		 Time counter_time = decisionTime;
+		 for(uint32_t i = 0; i < trackCWND.size(); ++i){
+			 dataset.Add(counter_time.GetMilliSeconds(), trackCWND[i]);
+			 counter_time += decisionTime;
+		 }
+		 plot.AddDataset(dataset);
+		 std::ofstream plotFile (plotFileName.c_str());
+		 plot.GenerateOutput (plotFile);
+		 plotFile.close ();
+
+		 fileNameWithNoExtension = "throughput-plot";
+		 graphicsFileName  = fileNameWithNoExtension + ".png";
+		 plotFileName  = fileNameWithNoExtension + ".plt";
+		 Gnuplot plot2 (graphicsFileName);
+		 plot2.SetTitle ("Throughput Validity");
+		 plot2.SetTerminal ("png");
+		 plot2.SetLegend ("time (ms)", "Throughput (Mbps)");
+		 //plot.AppendExtra ("set yrange [0:+1000]");
+		 Gnuplot2dDataset dataset2;
+		 Gnuplot2dDataset dataset3;
+		 dataset2.SetTitle("Estimated Throughput");
+		 dataset3.SetTitle("Expected Throughput");
+		 dataset2.SetStyle (Gnuplot2dDataset::LINES);
+		 dataset3.SetStyle (Gnuplot2dDataset::LINES);
+		 Time movingTime = trackCalculatedThroughput[0].first;
+		 Time basedTime = trackCalculatedThroughput[0].first;
+		 double moving_average = 0;
+		 uint32_t count = 0;
+		 for(uint32_t i = 0; i < trackCalculatedThroughput.size(); ++i){
+			 movingTime = trackCalculatedThroughput[i].first;
+			 if(movingTime - basedTime < MilliSeconds(20)){
+				 count++;
+				 moving_average += (trackCalculatedThroughput[i].second - moving_average)/count;
+			 }
+			 else{
+				 dataset2.Add(trackCalculatedThroughput[i].first.GetMilliSeconds(), moving_average);
+				 dataset3.Add(trackCalculatedThroughput[i].first.GetMilliSeconds(),trackExpectedThroughput);
+				 moving_average = 0;
+				 count = 0;
+				 basedTime = movingTime;
+			 }
+		 }
+		 plot2.AddDataset(dataset2);
+		 plot2.AddDataset(dataset3);
+		 std::ofstream plotFile2 (plotFileName.c_str());
+		 plot2.GenerateOutput (plotFile2);
+		 plotFile2.close ();
+		 return 0;
 }
+
+
+
 
 
