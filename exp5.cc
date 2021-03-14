@@ -36,8 +36,8 @@ bool readPolicy;
 bool readBias;
 uint8_t observationId;
 
-std::vector<uint32_t> trackCWND;
-std::vector<uint32_t> trackCWND2;
+std::vector<std::pair<Time, uint32_t>> trackCWND;
+std::vector<std::pair<Time, uint32_t>> trackCWND2;
 std::vector<uint32_t> trackQueueSize;
 double trackExpectedThroughput;
 std::vector<std::pair<Time, double>> trackCalculatedThroughput;
@@ -354,7 +354,6 @@ EnbApp::handleReadServer(Ptr<Socket> socket){
 		packet->PeekPacketTag(ecnTag);
 		packet->PeekPacketTag(tcpTag);
 		packet->PeekPacketTag(timeTag);
-
 		uint8_t ueId = tcpTag.getId();
 		if(m_queueCounter > m_maxQueueSize){
 					 double val = sample->GetValue();
@@ -372,7 +371,6 @@ EnbApp::handleRead(Ptr<Socket> socket){
 	++m_queueCounter;
 	trackQueueSize.push_back(m_queueCounter);
 	if(readQueue){
-		//if(m_queueCounter > 60)
 		std::cout<<"Current scheduler queue size: "<<m_queueCounter<<std::endl;
 	}
 	if(!m_running) {return;}
@@ -387,6 +385,7 @@ EnbApp::handleRead(Ptr<Socket> socket){
 		packet->PeekPacketTag(timeTag);
 
 		uint8_t ueId = tcpTag.getId();
+
 		accumulatedBytes[ueId] += packet->GetSize();
 		Time current_time = Simulator::Now();
 
@@ -862,8 +861,7 @@ RenoCompute::update(uint32_t cwnd, uint32_t countPacket){
 			new_cwnd = cwnd *2;
 	}
 	else{ //congestion avoidance mode
-		double adder = countPacket/cwnd;
-		adder = std::max(1.0,adder);
+		double adder = 1;
 		new_cwnd = cwnd + static_cast<uint16_t> (adder);
 	}
 	return new_cwnd;
@@ -871,9 +869,8 @@ RenoCompute::update(uint32_t cwnd, uint32_t countPacket){
 
 void
 RenoCompute::retransmit(uint32_t cwnd){
-	std::cout<<"TIMEOUT change ssThresh to = " << m_ssThresh << std::endl;
 	m_ssThresh =  cwnd/2;
-
+	//std::cout<<"TIMEOUT change ssThresh to = " << m_ssThresh << std::endl;
 }
 
 //------------------------------RenoCompute class definition ends here ------------------------
@@ -980,7 +977,7 @@ public:
 
 	void Setup (Address send, Address receive,  uint32_t packetSize, uint8_t ueId, DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
 			float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, std::vector<double> alphaTheta, double gamma, TCPControl tcpCtrl,  bool isPeriodic, uint16_t period, uint16_t uniqueID);
-
+	double getRTT();
 protected:
 	void handleRead(Ptr<Socket> socket);
 	void handleAccept(Ptr<Socket> socket, const Address& from);
@@ -1032,13 +1029,14 @@ private:
 	int m_actionBound;
 	TCPControl m_tcpCtrl;
 	bool m_ssMode;
-	uint16_t m_ssThreshRL;
+	uint32_t m_ssThreshRL;
 
 	bool m_isOn;
 	bool m_isPeriodic;
 	uint16_t m_clockCounter;
 	uint16_t m_period;
 	uint16_t m_uniqueID;
+	EventId m_timeoutEventId;
 };
 
 UEApp:: UEApp () {}
@@ -1076,14 +1074,14 @@ UEApp::StartApplication (void)
 {
   std::cout<< " Starting UE Application" << std::endl;
   m_estimatedRTT = 0;
-  m_devRTT = 0;
+  m_devRTT = 1e2;
   m_running = true;
   m_hasCalledNOAck = false;
   m_isCongested = false;
   m_countRx = 0;
   m_countTx = 0;
-  m_cwnd = 10;
-  m_cwndMax = 10;
+  m_cwnd = 1;
+  m_cwndMax = 1;
   if(m_tcpCtrl == TCPRL){
 	  rl = new RLCompute(m_alphaW, m_hiddenSize, m_alphaTheta, m_gamma, m_ueId);
   }
@@ -1099,7 +1097,7 @@ UEApp::StartApplication (void)
 	  exit(-1);
   }
   m_ssMode = true;
-  m_ssThreshRL = 655;
+  m_ssThreshRL = 1e6;
   m_RxcwndCounter = 0;
   m_cwndCounter = m_cwnd;
   m_averageReward = 0;
@@ -1117,10 +1115,8 @@ UEApp::StartApplication (void)
   m_socketReceiver->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_dlPort));
   m_socketReceiver->ShutdownSend();
   m_socketReceiver->SetRecvCallback(MakeCallback(&UEApp::handleRead, this));
-
-  Simulator::Schedule (m_decisionPeriod, &UEApp::updateReward, this);
   SendPacket();
-
+  std::cout<< "UE Application #" << m_uniqueID << " starts successfully" << std::endl;
  }
 
 void
@@ -1132,12 +1128,12 @@ UEApp::SendPacket(){
 		ScheduleTxNoACK();
 		return;
 	}
-	if(m_cwndCounter == 0){
+	if(m_hasCalledNOAck) return;
+	/*if(m_cwndCounter == 0){
 		ScheduleTx();
 		return;
-	}
+	}*/
 	Ptr<Packet> packet = Create<Packet> (m_packetSize);
-
 	CustomECNTag ecnTag;
 	CustomTCPTag tcpTag;
 	TimestampTag timeTag;
@@ -1152,13 +1148,14 @@ UEApp::SendPacket(){
 
 	m_socketSender->Send(packet);
 	++m_countTx;
-	ScheduleTx();
 	--m_cwndCounter;
-	m_hasCalledNOAck = false;
+	ScheduleTx();
 }
 
 void
 UEApp::SendPacketTimeout (){
+	if(m_tcpCtrl == TCPRL) m_ssThreshRL = m_cwnd/2;
+	 updateReward();
 	m_cwndCounter = m_cwnd;
 	 m_RxcwndCounter = 0;
 	 if(m_tcpCtrl == TCPReno) reno->retransmit(m_cwnd);
@@ -1176,31 +1173,30 @@ UEApp::SendPacketTimeout (){
 	packet->AddPacketTag(ecnTag);
 	packet->AddPacketTag(tcpTag);
 	packet->AddPacketTag(timeTag);
-
 	m_socketSender->Send(packet);
 	m_countTx++;
 	--m_cwndCounter;
 	m_hasCalledNOAck = false;
-
+	ScheduleTx();
 }
 
 void
 UEApp::ScheduleTx (void){
 	if (m_running)
 	    {
-	      Time tNext (Seconds (m_packetSize * 8 / (static_cast<double>(m_cwnd)*static_cast<double> (m_dataRate.GetBitRate ()))));
+	      Time tNext (1e9*m_packetSize * 8 / (static_cast<double> (m_dataRate.GetBitRate ())));
 	      m_sendEvent = Simulator::Schedule (tNext, &UEApp::SendPacket, this);
+
 	    }
 }
 
 void
 UEApp::ScheduleTxNoACK (void){
-	 ScheduleTx();
-	 Time tSchedule = Time((m_estimatedRTT + 4*m_devRTT)*1e6);
-
-	 //std::cout<<"Scheduling No ack time:"<<tSchedule.GetMilliSeconds()<<" ms"<<std::endl;
-	Simulator::Schedule(tSchedule, &UEApp::SendPacketTimeout, this);
+	 Time tSchedule = Time((1.1*m_estimatedRTT + 4*m_devRTT)*1e6);
+	m_timeoutEventId = Simulator::Schedule(tSchedule, &UEApp::SendPacketTimeout, this);
+	m_hasCalledNOAck = true;
 }
+
 void
 UEApp::StopApplication(void){
 	m_running = false;
@@ -1212,7 +1208,6 @@ UEApp::StopApplication(void){
 	m_socketSender->Close();
 	m_socketReceiver->Close();
 }
-
 void
 UEApp::handleRead(Ptr<Socket> socket){
 	if(m_cwnd > m_cwndMax) m_cwndMax = m_cwnd;
@@ -1267,22 +1262,31 @@ UEApp::handleRead(Ptr<Socket> socket){
 		  m_RxcwndCounter++;
 		  //std::cout<<"counter: "<<m_RxcwndCounter<<std::endl;
 		  if(m_RxcwndCounter == m_cwnd){
+			 if(m_hasCalledNOAck) m_timeoutEventId.Cancel();
+			  updateReward();
 			  m_cwndCounter = m_cwnd;
 			  m_RxcwndCounter = 0;
+			  m_hasCalledNOAck = false;
+			  SendPacket();
 		  }
 	}
 }
 
+double
+UEApp::getRTT(){
+	return m_estimatedRTT;
+}
+
 void
 UEApp::updateReward(){
-	if(readCWND && m_ueId == observationId){
+	if(readCWND && m_uniqueID== observationId){
 		std::cout<<"Current CWND = " << m_cwnd << std::endl;
 	}
 	if(m_uniqueID== 0){
-			trackCWND.push_back(m_cwnd);
+			trackCWND.push_back(std::make_pair(Simulator::Now(), m_cwnd));
 		}
 	if(m_uniqueID == observationId){
-			trackCWND2.push_back(m_cwnd);
+			trackCWND2.push_back(std::make_pair(Simulator::Now(), m_cwnd));
 		}
 	if(m_isPeriodic){
 		if(m_isOn && (m_clockCounter != m_period)){
@@ -1312,8 +1316,8 @@ UEApp::updateReward(){
 				m_averageReward = 0;
 				m_isCongested = false;
 				m_estimatedRTT = 0;
-				m_devRTT = 0;
-				m_ssThreshRL = 655;
+				m_devRTT = 1e2;
+				m_ssThreshRL = 1e6;
 				m_RxcwndCounter = 0;
 				m_hasCalledNOAck = false;
 				m_cwndCounter = m_cwnd;
@@ -1327,11 +1331,6 @@ UEApp::updateReward(){
 
 	}
 
-	if(m_cwndCounter == 0){
-		//Agent must do nothing when timeout
-		Simulator::Schedule (m_decisionPeriod, &UEApp::updateReward, this);
-		return;
-	}
 	State curr_state;
 	if(m_countRx == 0){
 		m_averageReward = m_negativeReward;
@@ -1372,11 +1371,11 @@ UEApp::updateReward(){
 			m_ssMode = false;
 			rl->compute(m_averageReward, curr_state, m_cwndMax);
 		}
-		if(m_cwnd > 10){
+		if(m_cwnd > 3){
 			m_cwnd = m_cwnd *3/4;
 		}
 		else{
-			m_cwnd = 10;
+			m_cwnd = 1;
 		}
 	}
 	else{
@@ -1390,10 +1389,10 @@ UEApp::updateReward(){
 			}
 			else{
 				change = rl->compute(m_averageReward, curr_state, m_cwndMax);
-			}
-			int test_cwnd = m_cwnd + change;
-			if(test_cwnd > 1){
-				m_cwnd += change;
+				int test_cwnd = m_cwnd + change;
+				if(test_cwnd > 1){
+					m_cwnd += change;
+				}
 			}
 		}
 		else if(m_tcpCtrl == TCPReno){
@@ -1403,10 +1402,10 @@ UEApp::updateReward(){
 			m_cwnd = cubic->OnData(m_minRTT, m_cwnd, m_estimatedRTT);
 		}
 	}
-	if(m_cwnd < 10){
-				m_cwnd = 10;
+	if(m_cwnd < 1){
+				m_cwnd = 1;
 		}
-	if(readCWND && m_ueId == observationId){
+	if(readCWND && m_uniqueID == observationId){
 		std::cout<<"Change of CWND = " << change << std::endl;
 	}
 	if(m_cwnd < m_cwndMax/4 && m_tcpCtrl == TCPRL){
@@ -1419,7 +1418,7 @@ UEApp::updateReward(){
 	m_countRx= 0;
 	m_countTx = 0;
 	m_averageReward = 0;
-	Simulator::Schedule (m_decisionPeriod, &UEApp::updateReward, this);
+
 }
 
 //----------------------------------------- UEApp class definition ends here --------------------------------------------------------
@@ -1525,7 +1524,8 @@ main (int argc, char *argv[])
 {
 		RngSeedManager::SetSeed(171);
 
-		observationId = 2; //Read which UE's policy and/or UE's cwnd
+		//For debugging purpose
+		observationId = 1; //Read which UE's policy and/or UE's cwnd
 		readThroughput = 2;
 		readQueue = false;
 		readReward = 2;
@@ -1540,7 +1540,7 @@ main (int argc, char *argv[])
 		uint16_t serverPortUl = 30000;
 		uint16_t serverPortDl = 40000;
 		Time startTime = Seconds(0.03);  //start application time
-		Time simTime = Seconds(15); //simulation time
+		Time simTime = Seconds(40); //simulation time
 		uint16_t packetSize = 1500; //size of 1 MTU in bytes
 
 		double errorRate = 0;  //Dropping rate due to receiving side of eNB 0 and UE 0
@@ -1549,23 +1549,22 @@ main (int argc, char *argv[])
 		double errorRate4 = 0;  //Dropping rate due to receiving side of server and eNB 1
 		double errorRate5 =0; //Dropping rate due to receiving side of UE 2 and eNB 1
 
-		DataRate dataRate = DataRate("0.1Mbps");  //Base rate for UE1
-		DataRate dataRate2 = DataRate("0.1Mbps");  //Base rate for UE 2
-		DataRate dataRate3 = DataRate("0.1Mbps");  //Base rate for UE 3
+		DataRate dataRate = DataRate("20Mbps");  //Base rate for UE1
+		DataRate dataRate2 = DataRate("20Mbps");  //Base rate for UE 2
+		DataRate dataRate3 = DataRate("20Mbps");  //Base rate for UE 3
 
 		//Parameters for queue
 
 		//eNB 0
 		uint16_t queueSize= 100;
-		Time queueDelay = MicroSeconds(100);
+		Time queueDelay = MicroSeconds(300);
 
 		//eNB 1
 		uint16_t queueSize1= 100;
-		Time queueDelay1 = MicroSeconds(100);
+		Time queueDelay1 = MicroSeconds(300);
 
-		float eta = 0.9;
-
-		double dropFullProbability = 0.9;
+		float eta = 0.9;  //Relative low throughput tolerance
+		double dropFullProbability = 0.9; //When the queue above the threshold(or queueSize)
 		float posReward = 3;
 		float negReward = -1;
 		Time decisionTime = MilliSeconds(20);
@@ -1575,11 +1574,11 @@ main (int argc, char *argv[])
 		std::vector<double> alphaTheta = std::vector<double>(alphaThetaArr, alphaThetaArr + 3);
 		double gamma = 0.9;
 		TCPControl tcp1 = TCPReno;
-		TCPControl tcp2 = TCPReno;
+		TCPControl tcp2 = TCPRL;
 		TCPControl tcp3 = TCPReno;
 		bool isExp4 = false;
 		uint16_t period = 200; //On off period
-		float chi = 0.95;
+		float chi = 1.33;
 
 		NodeContainer nodes;
 		nodes.Create (6); //index 0 is UE 0, index 1 is eNB 0, index 2 is server, index 3 is UE 1 index 4 is UE 2, index 5 is eNB 1
@@ -1745,26 +1744,16 @@ main (int argc, char *argv[])
 		 double cwnd2_avg = 0;
 		 double cwnd1_avgOn = 0;
 		 double cwnd2_avgOn = 0;
-		 bool isOn = true;
-		 uint32_t counterState = 0;
-		 for(uint32_t i = 0; i < std::min(trackCWND.size(), trackCWND2.size()); ++i){
+		 for(uint32_t i = 0; i < trackCWND.size(); ++i){
 			 count_cwnd++;
-			 uint64_t t = counter_time.GetMilliSeconds();
-			 dataset.Add(t, trackCWND[i]);
-			 ds.Add(counter_time.GetMilliSeconds(), trackCWND2[i]);
-			 cwnd1_avg += (trackCWND[i] - cwnd1_avg)/count_cwnd;
-			 cwnd2_avg += (trackCWND2[i] - cwnd2_avg)/count_cwnd;
-			 if(counterState > period){
-				 counterState = 0;
-				 isOn = !isOn;
-			 }
-			 if(isExp4 && isOn){
-				 count_cwnd4++;
-				 cwnd1_avgOn += (trackCWND[i] - cwnd1_avgOn)/count_cwnd4;
-				 cwnd2_avgOn += (trackCWND2[i] - cwnd2_avgOn)/count_cwnd4;
-			 }
-			 counter_time += decisionTime;
-			 counterState++;
+			 dataset.Add(trackCWND[i].first.GetMilliSeconds(), trackCWND[i].second);
+			 cwnd1_avg += (trackCWND[i].second - cwnd1_avg)/count_cwnd;
+		 }
+		 count_cwnd = 0;
+		 for(uint32_t i = 0; i < trackCWND2.size(); ++i){
+			 count_cwnd++;
+			 ds.Add(trackCWND2[i].first.GetMilliSeconds(), trackCWND2[i].second);
+			 cwnd2_avg += (trackCWND2[i].second - cwnd2_avg)/count_cwnd;
 		 }
 		 plot.AddDataset(dataset);
 		 plot.AddDataset(ds);
@@ -1855,8 +1844,8 @@ main (int argc, char *argv[])
 		 }
 		 else{
 			 std::cout<<"Expected throughput = "<< trackExpectedThroughput <<" Mbps" << std::endl;
-			 std::cout<<"Average throughput of UE 0 = "<< (cwnd1_avg*dataRate.GetBitRate()/1e6) << " Mbps" <<std::endl;
-			 std::cout<<"Average throughput of UE 1 = "<< (cwnd2_avg*dataRate2.GetBitRate()/1e6) << " Mbps" <<std::endl;
+			 std::cout<<"Average throughput of UE 0 = "<< ((cwnd1_avg*packetSize*8)/(app1->getRTT()*1e3)) << " Mbps" <<std::endl;
+			 std::cout<<"Average throughput of UE 1 = "<< ((cwnd2_avg*packetSize*8)/(app2->getRTT()*1e3)) << " Mbps" <<std::endl;
 		 }
 
 		 return 0;
