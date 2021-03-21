@@ -35,13 +35,25 @@ bool readCWND;
 bool readPolicy;
 bool readBias;
 uint8_t observationId;
+uint8_t whicheNB;
+bool verboseTr;
+
+uint8_t idCounter = 0;
 
 std::vector<std::pair<Time, uint32_t>> trackCWND;
 std::vector<std::pair<Time, uint32_t>> trackCWND2;
+std::vector<std::pair<Time, uint32_t>> trackCWND3;
 std::vector<uint32_t> trackQueueSize;
 double trackExpectedThroughput;
 std::vector<std::pair<Time, double>> trackCalculatedThroughput;
+std::vector<uint32_t> queue1;
+std::vector<uint32_t> queue2;
+std::vector<uint32_t> queue3;
 std::vector<std::pair<double, double>> trackState;
+
+struct Timeout{
+	Time time;
+};
 //------------------------------ Global variable definition ends here --------------------------------
 
 //------------------------------ Global function definition ends here --------------------------------
@@ -187,7 +199,7 @@ public:
 
 	void Setup (std::vector <std::pair<Address, uint8_t>> addressNodePairs,
 			 uint16_t ulPortOffset, uint16_t dlPortSGW, uint32_t packetSize,
-			float m_eta, Time timeDelay, uint16_t maxQueue, float dropP, Address server, uint16_t m_serverPort, bool isExp4, Time period, float chi);
+			float m_eta, Time timeDelay, uint16_t maxQueue, float dropP, Address server, uint16_t m_serverPort, bool isExp4, Time period);
 
 protected:
 	void handleRead(Ptr<Socket> socket);
@@ -207,6 +219,8 @@ private:
 	void setExpectedThroughput(bool isComingUE);
 	void exp1ChangeQueueSize();
 	void exp1ChangeQueueTime();
+	void updateUEStatus();
+
 
 	std::vector<Ptr<Socket>>     m_socketReceivers;
 	std::vector<Ptr<Socket>>  m_socketSenders;
@@ -224,9 +238,8 @@ private:
     float m_dropProbability;
     Ptr<UniformRandomVariable> sample;
     uint8_t m_numberOfUE;
-    float m_expectedThroughput; //Should be the same across the users to ensure fairness
-    std::vector<float> accumulatedBytes;
-    std::vector<double >current_throughput;
+    uint32_t m_expectedQueueUtilization; //Should be the same across the users to ensure fairness
+    std::vector<uint32_t> m_queueUtil;
     Address m_server;
     Ptr<Socket> m_socketToServer;
     Ptr<Socket> m_socketFromServer;
@@ -234,7 +247,8 @@ private:
     bool m_isExp4;
     Time m_period;
     bool m_exp4State;
-    float m_chi;
+    uint8_t m_eNBID;
+    uint8_t m_prevMax;
 };
 
 EnbApp::EnbApp ()
@@ -250,7 +264,7 @@ EnbApp::~EnbApp()
 void
 EnbApp::Setup (std::vector <std::pair<Address, uint8_t>> addressNodePairs,
 		uint16_t ulPortOffset, uint16_t dlPortSGW, uint32_t packetSize,
-		float eta, Time timeDelay, uint16_t maxQueue, float dropP, Address server, uint16_t serverPort, bool isExp4, Time period, float chi)
+		float eta, Time timeDelay, uint16_t maxQueue, float dropP, Address server, uint16_t serverPort, bool isExp4, Time period)
 {
   m_addressNodePairs = addressNodePairs;
   m_ulPortOffset = ulPortOffset;
@@ -269,28 +283,27 @@ EnbApp::Setup (std::vector <std::pair<Address, uint8_t>> addressNodePairs,
   m_isExp4 = isExp4;
   m_period = period;
   m_exp4State = true;
-  m_chi = chi;
+  m_eNBID = idCounter;
+  idCounter++;
+  m_prevMax = 99;
 }
 
 void
 EnbApp::setExpectedThroughput(bool isComingUE){
-
-	m_expectedThroughput = m_chi*m_packetSize*4/(m_serviceTime.GetMicroSeconds()) ;
-
 	if(isComingUE){
 		m_numberOfUE++;
-		m_expectedThroughput = m_expectedThroughput /m_numberOfUE;
-		accumulatedBytes.push_back(0);
-		current_throughput.push_back(0);
+		if(m_numberOfUE == 1) m_expectedQueueUtilization = m_maxQueueSize/2;
+		else m_expectedQueueUtilization =(m_numberOfUE - 1)* m_expectedQueueUtilization /m_numberOfUE;
+		m_queueUtil.push_back(0);
 	}
 	else{
 		m_numberOfUE--;
 		//TODO: handle deletion by id of USER, only worry this part when we are in handover stage
 		if(m_numberOfUE != 0){
-			m_expectedThroughput = m_expectedThroughput/m_numberOfUE;
+			m_expectedQueueUtilization = (m_numberOfUE + 1)*m_expectedQueueUtilization/m_numberOfUE;
 		}
 	}
-	trackExpectedThroughput = m_expectedThroughput;
+	trackExpectedThroughput = m_expectedQueueUtilization;
 	if(m_isExp4){
 			Simulator::Schedule(m_period, &EnbApp::setExpectedThroughput, this, !m_exp4State);
 			m_exp4State = !m_exp4State;
@@ -335,6 +348,7 @@ EnbApp::StartApplication (void)
 	sample->SetAttribute("Min", DoubleValue(0));
 	sample->SetAttribute("Max", DoubleValue(1));
 
+	Simulator::Schedule (m_serviceTime, &EnbApp::updateUEStatus, this);
 	//Simulator::Schedule (Seconds(50), &EnbApp::exp1ChangeQueueSize, this);
 	//Simulator::Schedule (Seconds(100), &EnbApp::exp1ChangeQueueTime, this);
 
@@ -355,7 +369,7 @@ EnbApp::handleReadServer(Ptr<Socket> socket){
 		packet->PeekPacketTag(tcpTag);
 		packet->PeekPacketTag(timeTag);
 		uint8_t ueId = tcpTag.getId();
-		if(m_queueCounter > m_maxQueueSize){
+		if(!ecnTag.isCongested()&&m_queueCounter > m_maxQueueSize){
 					 double val = sample->GetValue();
 					 if(val < m_dropProbability) {
 						 --m_queueCounter;
@@ -370,9 +384,6 @@ void
 EnbApp::handleRead(Ptr<Socket> socket){
 	++m_queueCounter;
 	trackQueueSize.push_back(m_queueCounter);
-	if(readQueue){
-		std::cout<<"Current scheduler queue size: "<<m_queueCounter<<std::endl;
-	}
 	if(!m_running) {return;}
 	Ptr<Packet> packet;
 	Address sender;
@@ -385,37 +396,32 @@ EnbApp::handleRead(Ptr<Socket> socket){
 		packet->PeekPacketTag(timeTag);
 
 		uint8_t ueId = tcpTag.getId();
-
-		accumulatedBytes[ueId] += packet->GetSize();
-		Time current_time = Simulator::Now();
+		m_queueUtil[ueId] += 1;
 
 		if(m_queueCounter > m_maxQueueSize){
 			 double val = sample->GetValue();
-			 if(val < m_dropProbability) {
-				 --m_queueCounter;
-				 return;}
-			 uint16_t maxIndex = max_element(current_throughput.begin(), current_throughput.end()) - current_throughput.begin();
-			 if(current_throughput[ueId] >m_expectedThroughput && maxIndex == ueId){
-				 ecnTag.setBits(3); //Congested State
+			 uint16_t maxIndex = max_element(m_queueUtil.begin(), m_queueUtil.end()) - m_queueUtil.begin();
+			 ecnTag.setBits(3); //Congested State
+			 if(maxIndex == ueId /*&& maxIndex != m_prevMax*/){
+				 std::cout << "Max index = " << (int)maxIndex << std::endl;
+				 std::cout << "queue 0  = " << (int)m_queueUtil[0] << std::endl;
+				 std::cout << "queue 1 = " << (int)m_queueUtil[1] << std::endl;
+				 std::cout << "queue 2 = " << (int)m_queueUtil[2] << std::endl;
+				 m_queueUtil[ueId] -= 1;
+				 Simulator::Schedule (m_queueCounter*m_serviceTime, &EnbApp::SendPacketToUE, this, ueId, ecnTag, timeTag);
+			    m_prevMax = maxIndex;
+				return;
 			 }
-			Simulator::Schedule (m_queueCounter*m_serviceTime, &EnbApp::SendPacketToUE, this, ueId, ecnTag, timeTag);
+			 if(val < m_dropProbability) {
+					 --m_queueCounter;
+					 m_queueUtil[ueId] -= 1;
+					 return;
+			 	}
+			Simulator::Schedule (m_queueCounter*m_serviceTime, &EnbApp::SendPacketToServer, this, ueId, ecnTag, timeTag);
 			return;
 		}
-
-		if(current_time - m_lastReceivedTimes[ueId]> m_serviceTime){ //Update measured throughput for each service time
-			current_throughput[ueId] = 0.6*current_throughput[ueId] + 0.4*accumulatedBytes[ueId]*8/(current_time - m_lastReceivedTimes[ueId]).GetMicroSeconds();
-			accumulatedBytes[ueId] = 0;
-			m_lastReceivedTimes[ueId] = current_time;
-		}
-		if(ueId == 0){
-			trackCalculatedThroughput.push_back(std::make_pair(current_time, current_throughput[0]));
-		}
-		if(readThroughput == ueId){
-			std::cout<<"Current throughput for user  "<<(int)ueId<<"is : "<<current_throughput[ueId] << std::endl;
-			std::cout<<"Compared throughput:"<<m_expectedThroughput<<std::endl;
-		}
 		if(ecnTag.isPositiveReward()){
-			if(current_throughput[ueId] > m_expectedThroughput|| current_throughput[ueId] < (m_eta*m_expectedThroughput)){
+			if(m_queueUtil[ueId] > m_expectedQueueUtilization|| m_queueUtil[ueId] < (m_eta*m_expectedQueueUtilization)){
 				//Send to UE directly
 				ecnTag.setBits(1); //You are penalized!
 			}
@@ -426,6 +432,21 @@ EnbApp::handleRead(Ptr<Socket> socket){
 
 }
 
+void
+EnbApp::updateUEStatus(){
+		Time current_time = Simulator::Now();
+		if(readThroughput < m_numberOfUE && m_eNBID == whicheNB){
+			if(verboseTr){
+				std::cout<<"Current queue usage for user  "<<(int)readThroughput<<" is : "<<m_queueUtil[readThroughput] << std::endl;
+				std::cout<<"Expected queue usage per user:"<<m_expectedQueueUtilization<<std::endl;
+			}
+				trackCalculatedThroughput.push_back(std::make_pair(current_time, m_queueUtil[readThroughput]));
+		}
+		queue1.push_back(m_queueUtil[0]);
+		queue2.push_back(m_queueUtil[1]);
+		queue3.push_back(m_queueUtil[2]);
+		Simulator::Schedule (m_serviceTime*10, &EnbApp::updateUEStatus, this);
+}
 void
 EnbApp::SendPacketToUE(uint8_t nodeId, CustomECNTag ecnTag, TimestampTag timeTag){
 	if(!m_running) {return;}
@@ -447,10 +468,11 @@ void
 EnbApp::SendPacketToServer (uint8_t nodeId, CustomECNTag ecnTag, TimestampTag timeTag){
 	if(!m_running) {return;}
 	--m_queueCounter;
+	m_queueUtil[nodeId] -= 1;
+
 	Ptr<Packet> packet = Create<Packet> (m_packetSize);
 	packet->AddPacketTag(ecnTag);
 	packet->AddPacketTag(timeTag);
-
 	CustomTCPTag tcpTag;
 	tcpTag.setId(nodeId);
 	packet->AddPacketTag(tcpTag);
@@ -656,8 +678,8 @@ void
 RLCompute::resetPolicyParams(){
 	 Ptr<UniformRandomVariable> sampleX = CreateObject<UniformRandomVariable>();
 
-		sampleX->SetAttribute("Min", DoubleValue(-0.1));
-		sampleX->SetAttribute("Max", DoubleValue(0));
+		sampleX->SetAttribute("Min", DoubleValue(-0.2));
+		sampleX->SetAttribute("Max", DoubleValue(-0.1));
 		m_thetaACK[0] = sampleX->GetValue();    // change = -sqrt(cwnd)
 		m_thetaRTT[0] = sampleX->GetValue();
 		m_thetaCWND[0] = sampleX->GetValue();
@@ -813,15 +835,17 @@ RLCompute::actionSelect(State state){
 		}
 		switch(index){
 			case 0:
-				return -floor(sqrt(state.cwndRatio*m_cwndMax));
-			case 1:
+				//return -floor(sqrt(state.cwndRatio*m_cwndMax));
 				return -1;
-			case 2:
+			case 1:
 				return 0;
-			case 3:
+			case 2:
 				return 1;
+			case 3:
+				return 2;
 			case 4:
-				return floor(sqrt(state.cwndRatio*m_cwndMax));
+				//return floor(sqrt(state.cwndRatio*m_cwndMax));
+				return 3;
 		}
 		return 0;
 
@@ -834,19 +858,19 @@ class RenoCompute{ //Note we do not consider fast recovery since we always assum
 private:
 	uint32_t m_ssThresh;
 	uint32_t m_initialCwnd;
-	uint32_t m_retxThresh;
 
 public:
 	void setSSThresh(uint32_t ssThresh);
 	uint32_t update(uint32_t cwnd, uint32_t countPacket); //note that this return cwnd instead of its change
 	RenoCompute();
-	void retransmit(uint32_t cwnd);
+	uint32_t retransmit(uint32_t cwnd);
+
 };
 
 RenoCompute::RenoCompute(){
 	 m_ssThresh = 1e6;
-	 m_initialCwnd = 10;
-	 m_retxThresh = 3;
+	 m_initialCwnd = 1;
+
 }
 
 void
@@ -856,21 +880,21 @@ RenoCompute::setSSThresh(uint32_t ssThresh){
 
 uint32_t
 RenoCompute::update(uint32_t cwnd, uint32_t countPacket){
-	uint16_t new_cwnd;
+	uint32_t new_cwnd;
 	if(cwnd < m_ssThresh){ //slow start mode
 			new_cwnd = cwnd *2;
 	}
 	else{ //congestion avoidance mode
 		double adder = 1;
-		new_cwnd = cwnd + static_cast<uint16_t> (adder);
+		new_cwnd = cwnd + static_cast<uint32_t> (adder);
 	}
 	return new_cwnd;
 }
 
-void
-RenoCompute::retransmit(uint32_t cwnd){
-	m_ssThresh =  cwnd/2;
-	//std::cout<<"TIMEOUT change ssThresh to = " << m_ssThresh << std::endl;
+uint32_t
+RenoCompute::retransmit(uint32_t cwnd){ //Called when there is a congestion notification
+	m_ssThresh =  cwnd*0.7;
+	return cwnd*0.7;
 }
 
 //------------------------------RenoCompute class definition ends here ------------------------
@@ -976,7 +1000,7 @@ public:
 	virtual ~UEApp();
 
 	void Setup (Address send, Address receive,  uint32_t packetSize, uint8_t ueId, DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
-			float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, std::vector<double> alphaTheta, double gamma, TCPControl tcpCtrl,  bool isPeriodic, uint16_t period, uint16_t uniqueID);
+			float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, std::vector<double> alphaTheta, double gamma, TCPControl tcpCtrl,  bool isPeriodic, uint16_t period, uint16_t uniqueID, Timeout rto);
 	double getRTT();
 protected:
 	void handleRead(Ptr<Socket> socket);
@@ -1037,6 +1061,8 @@ private:
 	uint16_t m_period;
 	uint16_t m_uniqueID;
 	EventId m_timeoutEventId;
+	Timeout m_to;
+	Time m_sinceTO;
 };
 
 UEApp:: UEApp () {}
@@ -1048,7 +1074,7 @@ UEApp:: ~UEApp() {
 
 void
 UEApp::Setup(Address addressSend, Address addressReceive, uint32_t packetSize, uint8_t ueId,  DataRate dataRate,  uint16_t ulPort, uint16_t dlPort, Time decisionPeriod,
-		float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, std::vector<double> alphaTheta, double gamma, TCPControl tcpCtrl, bool isPeriodic, uint16_t period, uint16_t uniqueID){
+		float positiveReward, float negativeReward, double alphaW, uint16_t hiddenSize, std::vector<double> alphaTheta, double gamma, TCPControl tcpCtrl, bool isPeriodic, uint16_t period, uint16_t uniqueID, Timeout rto){
 	m_packetSize = packetSize;
 	m_serverAddressSend = addressSend;
 	m_serverAddressReceive = addressReceive;
@@ -1067,6 +1093,7 @@ UEApp::Setup(Address addressSend, Address addressReceive, uint32_t packetSize, u
 	m_isPeriodic = isPeriodic;
 	m_period = period;
 	m_uniqueID = uniqueID;
+	m_to = rto;
 }
 
 void
@@ -1105,7 +1132,7 @@ UEApp::StartApplication (void)
 
   m_isOn = true;
   m_clockCounter = 0;
-
+  m_sinceTO = Simulator::Now();
   m_socketSender = Socket::CreateSocket (this->GetNode(), UdpSocketFactory::GetTypeId ());
   m_socketSender->Bind();
   m_socketSender->Connect (m_serverAddressSend);
@@ -1154,11 +1181,16 @@ UEApp::SendPacket(){
 
 void
 UEApp::SendPacketTimeout (){
-	if(m_tcpCtrl == TCPRL) m_ssThreshRL = m_cwnd/2;
-	 updateReward();
+	if(m_tcpCtrl == TCPRL){
+		m_cwnd = m_cwnd*0.7;
+		m_ssThreshRL = m_cwnd;
+		if(readCWND && m_uniqueID == observationId){
+						std::cout << "cwnd becomes halved due to timeout" << std::endl;
+			}
+	}
 	m_cwndCounter = m_cwnd;
 	 m_RxcwndCounter = 0;
-	 if(m_tcpCtrl == TCPReno) reno->retransmit(m_cwnd);
+	 if(m_tcpCtrl == TCPReno) m_cwnd = reno->retransmit(m_cwnd);
 	 if(m_tcpCtrl == TCPCubic) cubic->OnPacketLoss(m_cwnd);
 	Ptr<Packet> packet = Create<Packet> (m_packetSize);
 
@@ -1192,7 +1224,13 @@ UEApp::ScheduleTx (void){
 
 void
 UEApp::ScheduleTxNoACK (void){
-	 Time tSchedule = Time((1.1*m_estimatedRTT + 4*m_devRTT)*1e6);
+	Time tSchedule;
+	if(m_to.time> Time(0)){
+		tSchedule = m_to.time;
+	}
+	else{
+		tSchedule = Time((1.1*m_estimatedRTT + 8*m_devRTT)*1e6); //Original 4*
+	}
 	m_timeoutEventId = Simulator::Schedule(tSchedule, &UEApp::SendPacketTimeout, this);
 	m_hasCalledNOAck = true;
 }
@@ -1230,6 +1268,7 @@ UEApp::handleRead(Ptr<Socket> socket){
 				std::cout<<"Not ECN capable tag detected"<<std::endl;
 			}
 			else if(tag.isCongested() || m_isCongested){
+				//std::cout << "Congestion event with id = " << m_uniqueID << std::endl;
 				m_isCongested = true;
 			}
 			else if(tag.isPositiveReward()){
@@ -1281,13 +1320,17 @@ void
 UEApp::updateReward(){
 	if(readCWND && m_uniqueID== observationId){
 		std::cout<<"Current CWND = " << m_cwnd << std::endl;
+		std::cout<<"Current SS RL threshold = " << m_ssThreshRL << std::endl;
 	}
 	if(m_uniqueID== 0){
 			trackCWND.push_back(std::make_pair(Simulator::Now(), m_cwnd));
 		}
-	if(m_uniqueID == observationId){
+	if(m_uniqueID == 1){
 			trackCWND2.push_back(std::make_pair(Simulator::Now(), m_cwnd));
 		}
+	if(m_uniqueID == 2){
+				trackCWND3.push_back(std::make_pair(Simulator::Now(), m_cwnd));
+			}
 	if(m_isPeriodic){
 		if(m_isOn && (m_clockCounter != m_period)){
 			m_clockCounter++;
@@ -1368,14 +1411,21 @@ UEApp::updateReward(){
 	if(m_isCongested){
 		if(m_tcpCtrl == TCPRL){
 			curr_state.isTerminal = true;
+			m_ssThreshRL = m_cwnd*0.7;
+			if(m_cwnd > 3){
+				m_cwnd = m_cwnd *0.7;
+					}
+			else{
+				m_cwnd = 1;
+					}
+			if(readCWND && m_uniqueID == observationId){
+				std::cout << "cwnd becomes halved due to congestion" << std::endl;
+			}
 			m_ssMode = false;
 			rl->compute(m_averageReward, curr_state, m_cwndMax);
 		}
-		if(m_cwnd > 3){
-			m_cwnd = m_cwnd *3/4;
-		}
-		else{
-			m_cwnd = 1;
+		else if(m_tcpCtrl == TCPReno){
+			m_cwnd = reno->retransmit(m_cwnd);
 		}
 	}
 	else{
@@ -1384,11 +1434,19 @@ UEApp::updateReward(){
 			if(m_cwnd > m_ssThreshRL){
 				m_ssMode = false;
 			}
+			/*else{
+				m_ssMode = false;
+			}*/
 			if(m_ssMode){
 				m_cwnd = 2*m_cwnd;
 			}
 			else{
 				change = rl->compute(m_averageReward, curr_state, m_cwndMax);
+				if(m_cwnd + change <= m_ssThreshRL){
+					//std::cout << "Because " << m_cwnd + change << " <= " << m_ssThreshRL << std::endl;
+					change = 0;
+				}
+
 				int test_cwnd = m_cwnd + change;
 				if(test_cwnd > 1){
 					m_cwnd += change;
@@ -1408,12 +1466,11 @@ UEApp::updateReward(){
 	if(readCWND && m_uniqueID == observationId){
 		std::cout<<"Change of CWND = " << change << std::endl;
 	}
-	if(m_cwnd < m_cwndMax/4 && m_tcpCtrl == TCPRL){
-		rl->resetPolicyParams();
+	/*if(m_cwnd < m_cwndMax/4 && m_tcpCtrl == TCPRL){
 		m_ssMode = true;
 		m_cwndMax = 3*m_cwndMax/4;
 		m_ssThreshRL = 3*m_ssThreshRL/4;
-	}
+	}*/
 	m_isCongested = false;
 	m_countRx= 0;
 	m_countTx = 0;
@@ -1428,21 +1485,21 @@ class ServerApp : public Application{
 public:
 	ServerApp();
 	virtual ~ServerApp();
-	void Setup(Address enb, Address enb1,  uint32_t serverPort);
+	void Setup(Address enb, uint32_t serverPort);
 
 protected:
 	void handleRead(Ptr<Socket> socket);
 	void handleAccept(Ptr<Socket> socket, const Address& from);
-	void handleRead1(Ptr<Socket> socket);
+
 private:
 	virtual void StartApplication (void);
 	virtual void StopApplication (void);
 
 	bool m_running;
-	Ptr<Socket>    m_socketRecv[2];
-	Ptr<Socket>  m_socketSend[2];
-	Address m_eNBAddress[2];
-    uint32_t m_serverPort; //downlink
+	Ptr<Socket>    m_socketRecv;
+	Ptr<Socket>  m_socketSend;
+	Address m_eNBAddress;
+    uint32_t m_serverPort;
 };
 
 ServerApp::ServerApp(){
@@ -1454,9 +1511,8 @@ ServerApp::~ServerApp(){
 }
 
 void
-ServerApp::Setup(Address enb, Address enb1,  uint32_t serverPort){
-	m_eNBAddress[0] = enb;
-	m_eNBAddress[1] = enb1;
+ServerApp::Setup(Address enb,  uint32_t serverPort){
+	m_eNBAddress = enb;
 	m_serverPort = serverPort;
 }
 void
@@ -1465,35 +1521,24 @@ ServerApp::StartApplication (void)
   std::cout<< " Starting Server Application" << std::endl;
   m_running = true;
 
-  m_socketSend[0]= Socket::CreateSocket(this->GetNode(), UdpSocketFactory::GetTypeId());
-  m_socketSend[0]->Bind();
-  m_socketSend[0]->Connect(m_eNBAddress[0]);
-  m_socketSend[0]->ShutdownRecv();
+  m_socketSend= Socket::CreateSocket(this->GetNode(), UdpSocketFactory::GetTypeId());
+  m_socketSend->Bind();
+  m_socketSend->Connect(m_eNBAddress);
+  m_socketSend->ShutdownRecv();
 
-  m_socketSend[1] = Socket::CreateSocket(this->GetNode(), UdpSocketFactory::GetTypeId());
-  m_socketSend[1]->Bind();
-  m_socketSend[1]->Connect(m_eNBAddress[1]);
-  m_socketSend[1]->ShutdownRecv();
 
- m_socketRecv[0]= Socket::CreateSocket(this->GetNode(), UdpSocketFactory::GetTypeId());
- m_socketRecv[0]->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_serverPort));
- m_socketRecv[0]->ShutdownSend();
- m_socketRecv[0]->SetRecvCallback(MakeCallback(&ServerApp::handleRead, this));
-
- m_socketRecv[1] = Socket::CreateSocket(this->GetNode(), UdpSocketFactory::GetTypeId());
- m_socketRecv[1]->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_serverPort + 1));
- m_socketRecv[1]->ShutdownSend();
- m_socketRecv[1]->SetRecvCallback(MakeCallback(&ServerApp::handleRead1, this));
+ m_socketRecv= Socket::CreateSocket(this->GetNode(), UdpSocketFactory::GetTypeId());
+ m_socketRecv->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_serverPort));
+ m_socketRecv->ShutdownSend();
+ m_socketRecv->SetRecvCallback(MakeCallback(&ServerApp::handleRead, this));
 
  }
 
 void
 ServerApp::StopApplication(void){
 	m_running = false;
-	m_socketRecv[0]->Close();
-	m_socketRecv[1]->Close();
-	m_socketSend[0]->Close();
-	m_socketSend[1]->Close();
+	m_socketRecv->Close();
+	m_socketSend->Close();
 }
 
 void
@@ -1502,18 +1547,7 @@ ServerApp::handleRead(Ptr<Socket> socket){
 	Ptr<Packet> packet;
 	Address sender;
 	while((packet = socket->RecvFrom(sender))){
-		m_socketSend[0]->Send(packet);
-	}
-
-}
-
-void
-ServerApp::handleRead1(Ptr<Socket> socket){
-	if(!m_running) {return;}
-	Ptr<Packet> packet;
-	Address sender;
-	while((packet = socket->RecvFrom(sender))){
-		m_socketSend[1]->Send(packet);
+		m_socketSend->Send(packet);
 	}
 
 }
@@ -1522,66 +1556,63 @@ ServerApp::handleRead1(Ptr<Socket> socket){
 int
 main (int argc, char *argv[])
 {
-		RngSeedManager::SetSeed(171);
+		RngSeedManager::SetSeed(23);
 
 		//For debugging purpose
-		observationId = 1; //Read which UE's policy and/or UE's cwnd
-		readThroughput = 2;
+		observationId = 2; //Read which UE's policy and/or UE's cwnd
+
+		readThroughput = 2; //Read which UE's queue util
+		whicheNB = 0;
+		verboseTr = false;
+
 		readQueue = false;
-		readReward = 2;
-		readCWND = false;
-		readPolicy = false;
+		readReward = 3;
+		readCWND = true;
+		readPolicy = true;
 		readBias = false;
 
 		uint16_t ulPort = 10000;  //Uplink port offset for eNB0
 		uint16_t dlPort = 20000;  //Downlink port offset for eNB0
-		uint16_t ulPort1 = 50000;  //Uplink port offset for eNB1
-		uint16_t dlPort1 = 60000; //Downlink port offset for eNB1
 		uint16_t serverPortUl = 30000;
 		uint16_t serverPortDl = 40000;
 		Time startTime = Seconds(0.03);  //start application time
-		Time simTime = Seconds(40); //simulation time
+		Time simTime = Seconds(160); //simulation time
 		uint16_t packetSize = 1500; //size of 1 MTU in bytes
+		Timeout rto = {MilliSeconds(0)}; //0 means using RFC standard
 
-		double errorRate = 0;  //Dropping rate due to receiving side of eNB 0 and UE 0
-		double errorRate2 = 0;  //Dropping rate due to receiving side of server and eNB 0
-		double errorRate3 = 0;  //Dropping rate due to receiving side of eNB 0 and UE 1
-		double errorRate4 = 0;  //Dropping rate due to receiving side of server and eNB 1
-		double errorRate5 =0; //Dropping rate due to receiving side of UE 2 and eNB 1
+		double errorRate = 5e-7;  //Dropping rate due to receiving side of eNB 0 and UE 0
+		double errorRate2 = 5e-7;  //Dropping rate due to receiving side of server and eNB 0
+		double errorRate3 = 5e-7;  //Dropping rate due to receiving side of eNB 0 and UE 1
+		double errorRate4 = 5e-7;  //Dropping rate due to receiving side of UE 2 and eNB 1
 
-		DataRate dataRate = DataRate("20Mbps");  //Base rate for UE1
-		DataRate dataRate2 = DataRate("20Mbps");  //Base rate for UE 2
-		DataRate dataRate3 = DataRate("20Mbps");  //Base rate for UE 3
+		DataRate dataRate = DataRate("8Mbps");  //Base rate for UE1 Dont set too high
+		DataRate dataRate2 = DataRate("8Mbps");  //Base rate for UE 2 Dont set too high
+		DataRate dataRate3 = DataRate("8Mbps");  //Base rate for UE 3 Dont set too high
 
 		//Parameters for queue
 
 		//eNB 0
-		uint16_t queueSize= 100;
-		Time queueDelay = MicroSeconds(300);
+		uint16_t queueSize= 300;
+		Time queueDelay = MicroSeconds(400); //500
 
-		//eNB 1
-		uint16_t queueSize1= 100;
-		Time queueDelay1 = MicroSeconds(300);
-
-		float eta = 0.9;  //Relative low throughput tolerance
-		double dropFullProbability = 0.9; //When the queue above the threshold(or queueSize)
-		float posReward = 3;
+		float eta = 0.8;  //Relative low throughput tolerance
+		double dropFullProbability = 0.95; //When the queue above the threshold(or queueSize) 0.95
+		float posReward = 7;
 		float negReward = -1;
 		Time decisionTime = MilliSeconds(20);
-		double alphaW = 0.005;
-		uint32_t hiddenSize = 7;
-		double alphaThetaArr[3] ={4e-3, 4e-3, 4e-3};
+		double alphaW = 5e-4; //5e-4
+		uint32_t hiddenSize = 10; //7
+		double alphaThetaArr[3] ={7e-4, 7e-4, 7e-4};
 		std::vector<double> alphaTheta = std::vector<double>(alphaThetaArr, alphaThetaArr + 3);
 		double gamma = 0.9;
-		TCPControl tcp1 = TCPReno;
+		TCPControl tcp1 = TCPRL;
 		TCPControl tcp2 = TCPRL;
-		TCPControl tcp3 = TCPReno;
+		TCPControl tcp3 = TCPRL;
 		bool isExp4 = false;
 		uint16_t period = 200; //On off period
-		float chi = 1.33;
 
 		NodeContainer nodes;
-		nodes.Create (6); //index 0 is UE 0, index 1 is eNB 0, index 2 is server, index 3 is UE 1 index 4 is UE 2, index 5 is eNB 1
+		nodes.Create (5); //index 0 is UE 0, index 1 is eNB 0, index 2 is server, index 3 is UE 1 index 4 is UE 2
 
 		PointToPointHelper pointToPoint; //Between UE0 and eNB 0
 		pointToPoint.SetDeviceAttribute ("DataRate", StringValue ("1Gbps"));
@@ -1598,12 +1629,8 @@ main (int argc, char *argv[])
 		p2pue2.SetChannelAttribute ("Delay", StringValue ("1ms"));
 		p2pue2.SetQueue ("ns3::DropTailQueue", "MaxSize", StringValue ("80000000p"));
 
-		PointToPointHelper p2pserver1; //Between eNB 1 and server
-		p2pserver1.SetDeviceAttribute ("DataRate", StringValue ("1Gbps"));
-		p2pserver1.SetChannelAttribute ("Delay", StringValue ("2ms"));
-		p2pserver1.SetQueue ("ns3::DropTailQueue", "MaxSize", StringValue ("80000000p"));
 
-		PointToPointHelper p2ue3; //Between UE 2 and eNB 1
+		PointToPointHelper p2ue3; //Between UE 2 and eNB 0
 		p2ue3.SetDeviceAttribute ("DataRate", StringValue ("1Gbps"));
 		p2ue3.SetChannelAttribute ("Delay", StringValue ("1ms"));
 		p2ue3.SetQueue ("ns3::DropTailQueue", "MaxSize", StringValue ("80000000p"));
@@ -1618,11 +1645,8 @@ main (int argc, char *argv[])
 		NetDeviceContainer devicesUeEnb2;
 		devicesUeEnb2 = p2pue2.Install(nodes.Get(3), nodes.Get(1));
 
-		NetDeviceContainer devicesEnbServer2;
-		devicesEnbServer2 = p2pserver1.Install(nodes.Get(5), nodes.Get(2));
-
 		NetDeviceContainer devicesUeEnb3;
-		devicesUeEnb3 = p2ue3.Install(nodes.Get(4), nodes.Get(5));
+		devicesUeEnb3 = p2ue3.Install(nodes.Get(4), nodes.Get(1));
 
 		InternetStackHelper stack;
 		stack.Install (nodes);
@@ -1644,13 +1668,8 @@ main (int argc, char *argv[])
 
 		Ptr<RateErrorModel> em4 = CreateObject<RateErrorModel>();
 		em4->SetAttribute("ErrorRate", DoubleValue(errorRate4));
-		devicesEnbServer2.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue (em4));
-		devicesEnbServer2.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue (em4));
-
-		Ptr<RateErrorModel> em5 = CreateObject<RateErrorModel>();
-		em5->SetAttribute("ErrorRate", DoubleValue(errorRate5));
-		devicesUeEnb3.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue (em5));
-		devicesUeEnb3.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue (em5));
+		devicesUeEnb3.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue (em4));
+		devicesUeEnb3.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue (em4));
 
 		 Ipv4AddressHelper ipv4;
 		 ipv4.SetBase ("10.1.1.0", "255.255.255.0");
@@ -1663,20 +1682,19 @@ main (int argc, char *argv[])
 		 Ipv4InterfaceContainer interfacesEnbServer = ipv4.Assign(devicesEnbServer);
 
 		 ipv4.SetBase("10.1.4.0", "255.255.255.0");
-		 Ipv4InterfaceContainer interfacesEnbServer2 = ipv4.Assign(devicesEnbServer2);
-
-		 ipv4.SetBase("10.1.5.0", "255.255.255.0");
 		 Ipv4InterfaceContainer interfacesUeEnb3 = ipv4.Assign(devicesUeEnb3);
 
 		 //App for eNB0
 		Ptr<EnbApp> app = CreateObject<EnbApp>();
 		std::pair <Address, uint8_t> ueenbpair = std::make_pair(InetSocketAddress(interfacesUeEnb.GetAddress (0),dlPort),0);
 		std::pair <Address, uint8_t> ueenbpair2 = std::make_pair(InetSocketAddress(interfacesUeEnb2.GetAddress (0),dlPort+1),1);
+		std::pair <Address, uint8_t> ueenbpair3 = std::make_pair(InetSocketAddress(interfacesUeEnb3.GetAddress (0),dlPort+2),2);
 		std::vector<std::pair <Address, uint8_t>> pairHolder;
 		pairHolder.push_back(ueenbpair);
 		pairHolder.push_back(ueenbpair2);
+		pairHolder.push_back(ueenbpair3);
 
-		app->Setup(pairHolder, ulPort, 80, packetSize, eta, queueDelay, queueSize, dropFullProbability, InetSocketAddress(interfacesEnbServer.GetAddress(1), serverPortDl), serverPortUl, isExp4, period*decisionTime, chi);
+		app->Setup(pairHolder, ulPort, 80, packetSize, eta, queueDelay, queueSize, dropFullProbability, InetSocketAddress(interfacesEnbServer.GetAddress(1), serverPortDl), serverPortUl, isExp4, period*decisionTime);
 		app->SetStartTime (startTime);
 		app->SetStopTime (simTime);
 		nodes.Get(1)->AddApplication(app);
@@ -1684,7 +1702,7 @@ main (int argc, char *argv[])
 		//App for UE0
 		Ptr<UEApp> app1 = CreateObject<UEApp>();
 		app1->Setup(InetSocketAddress(interfacesUeEnb.GetAddress(1), ulPort), InetSocketAddress(interfacesUeEnb.GetAddress(0), dlPort), packetSize, 0,  dataRate, ulPort, dlPort, decisionTime, posReward,
-				negReward, alphaW, hiddenSize, alphaTheta, gamma, tcp1, false, 0, 0);
+				negReward, alphaW, hiddenSize, alphaTheta, gamma, tcp1, false, 0, 0, rto);
 		app1->SetStartTime (startTime);
 		app1->SetStopTime (simTime);
 		nodes.Get(0)->AddApplication(app1);
@@ -1692,28 +1710,21 @@ main (int argc, char *argv[])
 		//App for UE1
 		Ptr<UEApp> app2 = CreateObject<UEApp>();
 		app2->Setup(InetSocketAddress(interfacesUeEnb2.GetAddress(1), ulPort+1), InetSocketAddress(interfacesUeEnb2.GetAddress(0), dlPort), packetSize, 1,  dataRate2, ulPort, dlPort+1, decisionTime, posReward,
-				negReward, alphaW, hiddenSize, alphaTheta, gamma, tcp2, isExp4, period, 1);
+				negReward, alphaW, hiddenSize, alphaTheta, gamma, tcp2, isExp4, period, 1, rto);
 		app2->SetStartTime(startTime);
 		app2->SetStopTime(simTime);
 		nodes.Get(3)->AddApplication(app2);
 
-		//App for eNB1
-		Ptr<EnbApp> app3 = CreateObject<EnbApp>();
-		std::pair <Address, uint8_t> ueenbpair3 = std::make_pair(InetSocketAddress(interfacesUeEnb3.GetAddress (0),dlPort1),0);
-		std::vector<std::pair <Address, uint8_t>> pairHolder1;
-		pairHolder1.push_back(ueenbpair3);
-		app3->Setup(pairHolder1, ulPort1, 80, packetSize, eta, queueDelay1, queueSize1, dropFullProbability, InetSocketAddress(interfacesEnbServer2.GetAddress(1), serverPortDl + 1), serverPortUl + 1, isExp4, period*decisionTime, chi);
-		nodes.Get(5)->AddApplication(app3);
 		//App for UE2
 		Ptr<UEApp> app4 = CreateObject<UEApp>();
-		app4->Setup(InetSocketAddress(interfacesUeEnb3.GetAddress(1), ulPort1), InetSocketAddress(interfacesUeEnb3.GetAddress(0), dlPort1), packetSize, 0,  dataRate3, ulPort1, dlPort1, decisionTime, posReward,
-						negReward, alphaW, hiddenSize, alphaTheta, gamma, tcp3, false, 0, 2);
+		app4->Setup(InetSocketAddress(interfacesUeEnb3.GetAddress(1), ulPort + 2), InetSocketAddress(interfacesUeEnb3.GetAddress(0), dlPort), packetSize, 2,  dataRate3, ulPort, dlPort + 2, decisionTime, posReward,
+						negReward, alphaW, hiddenSize, alphaTheta, gamma, tcp3, false, 0, 2, rto);
 		app4->SetStartTime(startTime);
 		app4->SetStopTime(simTime);
 		nodes.Get(4)->AddApplication(app4);
 
 		Ptr<ServerApp> serverApp = CreateObject<ServerApp>();
-		serverApp->Setup(InetSocketAddress(interfacesEnbServer.GetAddress(0), serverPortUl), InetSocketAddress(interfacesEnbServer2.GetAddress(0), serverPortUl + 1), serverPortDl);
+		serverApp->Setup(InetSocketAddress(interfacesEnbServer.GetAddress(0), serverPortUl),  serverPortDl);
 		serverApp->SetStartTime(startTime);
 		serverApp->SetStopTime(simTime);
 		nodes.Get(2)->AddApplication(serverApp);
@@ -1721,7 +1732,6 @@ main (int argc, char *argv[])
 		Simulator::Stop (simTime);
 		Simulator::Run ();
 		Simulator::Destroy ();
-
 		 std::string fileNameWithNoExtension = "cwnd-plot";
 		 std::string graphicsFileName  = fileNameWithNoExtension + ".png";
 		 std::string plotFileName  = fileNameWithNoExtension + ".plt";
@@ -1730,18 +1740,22 @@ main (int argc, char *argv[])
 		 plot.SetTitle ("CWND trend");
 		 plot.SetTerminal ("png");
 		 plot.SetLegend ("time (ms)", "CWND");
-		 plot.AppendExtra ("set yrange [0:+600]");
+		 plot.AppendExtra ("set yrange [0:+500]");
 		 Gnuplot2dDataset dataset;
 		 Gnuplot2dDataset ds;
+		 Gnuplot2dDataset datas;
 		 dataset.SetTitle("UE 0");
 		 dataset.SetStyle (Gnuplot2dDataset::LINES);
 		 ds.SetTitle("UE 1");
 		 ds.SetStyle (Gnuplot2dDataset::LINES);
+		 datas.SetTitle("UE 2");
+		 datas.SetStyle (Gnuplot2dDataset::LINES);
 		 Time counter_time = decisionTime;
 		 uint32_t count_cwnd = 0;
 		 uint32_t count_cwnd4 = 0;
 		 double cwnd1_avg = 0;
 		 double cwnd2_avg = 0;
+		 double cwnd3_avg = 0;
 		 double cwnd1_avgOn = 0;
 		 double cwnd2_avgOn = 0;
 		 for(uint32_t i = 0; i < trackCWND.size(); ++i){
@@ -1750,13 +1764,21 @@ main (int argc, char *argv[])
 			 cwnd1_avg += (trackCWND[i].second - cwnd1_avg)/count_cwnd;
 		 }
 		 count_cwnd = 0;
+
 		 for(uint32_t i = 0; i < trackCWND2.size(); ++i){
 			 count_cwnd++;
-			 ds.Add(trackCWND2[i].first.GetMilliSeconds(), trackCWND2[i].second);
+			 datas.Add(trackCWND2[i].first.GetMilliSeconds(), trackCWND2[i].second);
 			 cwnd2_avg += (trackCWND2[i].second - cwnd2_avg)/count_cwnd;
 		 }
+		 count_cwnd = 0;
+		 for(uint32_t i = 0; i < trackCWND3.size(); ++i){
+					 count_cwnd++;
+					 ds.Add(trackCWND3[i].first.GetMilliSeconds(), trackCWND3[i].second);
+					 cwnd3_avg += (trackCWND3[i].second - cwnd3_avg)/count_cwnd;
+				 }
 		 plot.AddDataset(dataset);
 		 plot.AddDataset(ds);
+		 plot.AddDataset(datas);
 		 std::ofstream plotFile (plotFileName.c_str());
 		 plot.GenerateOutput (plotFile);
 		 plotFile.close ();
@@ -1765,23 +1787,26 @@ main (int argc, char *argv[])
 		 graphicsFileName  = fileNameWithNoExtension + ".png";
 		 plotFileName  = fileNameWithNoExtension + ".plt";
 		 Gnuplot plot2 (graphicsFileName);
-		 plot2.SetTitle ("Throughput Validity");
+		 plot2.SetTitle ("Queue Validity");
 		 plot2.SetTerminal ("png");
-		 plot2.SetLegend ("time (ms)", "Throughput (Mbps)");
-		 plot2.AppendExtra ("set yrange [0:+4]");
+		 plot2.SetLegend ("time (ms)", "Num of packets inside the queue");
+		 plot2.AppendExtra ("set yrange [0:+250]");
 		 //plot.AppendExtra ("set yrange [0:+1000]");
 		 Gnuplot2dDataset dataset2;
 		 Gnuplot2dDataset dataset3;
-		 dataset2.SetTitle("Estimated Throughput");
-		 dataset3.SetTitle("Expected Throughput");
+		 Gnuplot2dDataset dataset4;
+		 dataset2.SetTitle("Queue Allocation");
+		 dataset3.SetTitle("Upper bound");
+		 dataset4.SetTitle("Lower bound");
 		 dataset2.SetStyle (Gnuplot2dDataset::LINES);
 		 dataset3.SetStyle (Gnuplot2dDataset::LINES);
+		 dataset4.SetStyle (Gnuplot2dDataset::LINES);
 		 Time movingTime = trackCalculatedThroughput[0].first;
 		 Time basedTime = trackCalculatedThroughput[0].first;
 
 		 double moving_average = 0;
 		 uint32_t count = 0;
-		 for(uint32_t i = 0; i < trackCalculatedThroughput.size(); ++i){
+		 for(uint32_t i = 1; i < trackCalculatedThroughput.size(); ++i){
 			 movingTime = trackCalculatedThroughput[i].first;
 			 if(movingTime - basedTime < 5*decisionTime){
 				 count++;
@@ -1790,14 +1815,15 @@ main (int argc, char *argv[])
 			 else{
 				 dataset2.Add(trackCalculatedThroughput[i].first.GetMilliSeconds(), moving_average);
 				 dataset3.Add(trackCalculatedThroughput[i].first.GetMilliSeconds(),trackExpectedThroughput);
+				 dataset4.Add(trackCalculatedThroughput[i].first.GetMilliSeconds(),eta*trackExpectedThroughput);
 				 moving_average = 0;
 				 count = 0;
 				 basedTime = movingTime;
 			 }
 		 }
-
 		 plot2.AddDataset(dataset2);
 		 plot2.AddDataset(dataset3);
+		 plot2.AddDataset(dataset4);
 		 std::ofstream plotFile2 (plotFileName.c_str());
 		 plot2.GenerateOutput (plotFile2);
 		 plotFile2.close ();
@@ -1814,7 +1840,7 @@ main (int argc, char *argv[])
 		 scatterSet.SetStyle (Gnuplot2dDataset::DOTS);
 		 for(uint32_t i = 0; i < trackState.size(); ++i){
 			 scatterSet.Add(trackState[i].first,trackState[i].second);
-		 }
+		 }std::cout<<"Utilization of UE 1 = "<< ((cwnd2_avg*packetSize*8)/(app2->getRTT()*dataRate2.GetBitRate()*1e3)) <<std::endl;
 		 plotS.AddDataset(scatterSet);
 		 std::ofstream plotFilesc (plotFileName.c_str());
 		 plotS.GenerateOutput (plotFilesc);
@@ -1840,14 +1866,22 @@ main (int argc, char *argv[])
 			 std::cout<<"cwnd avg of UE 0 when UE 1 is on = " << (cwnd1_avgOn*dataRate.GetBitRate()/1e6)<< " Mbps"<<std::endl;
 			 double avg_cwnd = (cwnd1_avg*count_cwnd - cwnd1_avgOn*count_cwnd4)/(count_cwnd - count_cwnd4);
 			 std::cout<<"cwnd avg of UE 0 when UE 1 is off = " << (avg_cwnd*dataRate.GetBitRate()/1e6) << " Mbps"<<std::endl;
-			 std::cout<<"cwnd avg of UE 1 when on = " << (cwnd2_avgOn*dataRate.GetBitRate()/1e6)  << " Mbps"<<std::endl;
+			 std::cout<<"cwnd avg of UE 1 when on = " << (cwnd2_avgOn*dataRate2.GetBitRate()/1e6)  << " Mbps"<<std::endl;
 		 }
 		 else{
-			 std::cout<<"Expected throughput = "<< trackExpectedThroughput <<" Mbps" << std::endl;
-			 std::cout<<"Average throughput of UE 0 = "<< ((cwnd1_avg*packetSize*8)/(app1->getRTT()*1e3)) << " Mbps" <<std::endl;
-			 std::cout<<"Average throughput of UE 1 = "<< ((cwnd2_avg*packetSize*8)/(app2->getRTT()*1e3)) << " Mbps" <<std::endl;
+			 std::cout<<"Utilization of UE 0 = "<< ((cwnd1_avg*packetSize*8)/(app1->getRTT()*dataRate.GetBitRate()*1e3))  <<std::endl;
+			 std::cout<<"Utilization of UE 1 = "<< ((cwnd2_avg*packetSize*8)/(app2->getRTT()*dataRate2.GetBitRate()*1e3)) <<std::endl;
+			 std::cout<<"Utilization of UE 2 = "<< ((cwnd3_avg*packetSize*8)/(app4->getRTT()*dataRate3.GetBitRate()*1e3)) <<std::endl;
+			 std::cout<< "Average RTT for UE 0 = " << app1->getRTT() <<" ms" <<  std::endl;
+			 std::cout<<"Average RTT for UE 1 = " << app2->getRTT() << " ms" << std::endl;
+			 std::cout<<"Average RTT for UE 2 = " << app4->getRTT() << " ms" << std::endl;
+			 //Use Jain's fairness index with 1/3 being the worst and 1 being the best
+			 double queue0Avg = 1.0*std::accumulate(queue1.begin(), queue1.end(), 0LL)/queue1.size();
+			 double queue1Avg = 1.0*std::accumulate(queue2.begin(), queue2.end(), 0LL)/queue2.size();
+			 double queue2Avg = 1.0*std::accumulate(queue3.begin(), queue3.end(), 0LL)/queue3.size();
+			 double fairness = std::pow((queue0Avg + queue1Avg + queue2Avg),2)/(3*(queue0Avg*queue0Avg + queue1Avg*queue1Avg +queue2Avg*queue2Avg ));
+			 std::cout<<"Fairness metric = " << fairness <<std::endl;
 		 }
-
 		 return 0;
 }
 
